@@ -1,5 +1,5 @@
 /**
- * SureFeed Microchip Pet Feeder - Rock-Solid Button & Sensor Controller
+ * SureFeed Microchip Pet Feeder - Real-Time Motor Current Sensing & Stall Detection
  * Target: STM32L071VZT6 (LQFP100)
  * 
  * Hardware Mappings:
@@ -8,47 +8,68 @@
  * - Both ON (PC10 RESET + PA15 RESET) = Solid Orange / Amber
  * 
  * Inputs:
- * - Open / Close (SW2): Detected via PA1 (Active HIGH) or PA6 (drop > 350) -> Solid RED
- * - Add Pet      (SW1): PA6 with internal pull-up (drop > 150)             -> Solid ORANGE
- * - Learn Mode   (SW3): PA6 with internal pull-up (drop > 45)              -> Solid GREEN
- * - Idle: Both LEDs OFF, Green pulses 40ms heartbeat every 1.2s
+ * - Open / Close (SW2): PA1 (ADC_IN1) > 1800 counts
+ * - Add Pet      (SW1): PA1 (ADC_IN1) 1000 - 1800 counts -> Drives Motor CLOSE
+ * - Learn Mode   (SW3): PA1 (ADC_IN1) 400 - 1000 counts  -> Drives Motor OPEN
+ * - Slider Switch: PE4 (Common ground driven LOW) + PB3 (Pos 1), PB4 (Pos 2), PB5 (Pos 3)
  * 
- * Mains Hum Rejection:
- * - PA6 is sampled synchronously across 20ms (full 50Hz AC period)
- *   so 50Hz induced mains ripple integrates to 0.
+ * Motor H-Bridge:
+ * - PE11 (Pin 42): Forward / OPEN
+ * - PE12 (Pin 43): Reverse / CLOSE
+ * - Shoot-through dead-time strictly enforced in software.
+ * 
+ * Multi-Channel Current Sense & Stall Detection:
+ * - High-speed scanning across all candidate ADC channels (0..15).
+ * - Tracks idle baseline, run peak, and stall surge (delta).
+ * - Automatic stall cutoff with startup blanking window.
  */
 
 #include "stm32l0xx_hal.h"
 #include <stdlib.h>
 
-#define LOG_MAGIC 0xFEEDC014
+#define LOG_MAGIC 0xFEEDC015
 #define LOG_SIZE  64
 
 typedef enum {
     BTN_NONE       = 0,
-    BTN_OPEN_CLOSE = 1,  /* SW2 on PA1 or PA6 */
-    BTN_ADD_PET    = 2,  /* SW1 on PA6 (2.2k ohm) */
-    BTN_LEARN      = 3   /* SW3 on PA6 (7.5k ohm) */
+    BTN_OPEN_CLOSE = 1,  /* SW2 on PA1 (~2050 counts) */
+    BTN_ADD_PET    = 2,  /* SW1 on PA1 (~1350 counts) */
+    BTN_LEARN      = 3   /* SW3 on PA1 (~700 counts)  */
 } ButtonId;
+
+typedef enum {
+    MOTOR_STOP  = 0,
+    MOTOR_OPEN  = 1,  /* Forward (PE11 = HIGH) */
+    MOTOR_CLOSE = 2   /* Reverse (PE12 = HIGH) */
+} MotorDirection;
 
 typedef struct {
     uint32_t timestamp_ms;
-    uint32_t type;       /* 1 = Digital Event, 2 = ADC Event, 3 = Button State */
-    uint32_t param1;     /* ButtonId or Port */
-    uint32_t param2;     /* Drop counts or Pin */
-    uint32_t param3;     /* Raw ADC or State */
+    uint32_t type;       /* 1=Digital, 2=ADC shift, 3=Button, 4=Slider, 5=Stall Cutoff */
+    uint32_t param1;     /* Channel, ButtonId, or Port */
+    uint32_t param2;     /* Surge counts, Pin, or IDR */
+    uint32_t param3;     /* Runtime ms or State */
 } LogEvent;
 
 typedef struct {
     uint32_t magic;
     uint32_t event_count;
     uint32_t head_index;
-    uint32_t live_adc[8];    /* [1]=PA1, [4]=PA4, [5]=PA5, [6]=PA6 */
-    uint32_t live_idr[5];    /* [0]=Port A, [1]=Port B, etc. */
-    uint32_t active_button;  /* 0=None, 1=Open/Close, 2=Add Pet, 3=Learn */
-    uint32_t adc6_baseline;  /* Tracked idle baseline on PA6 */
-    uint32_t adc6_smooth;    /* 20ms filtered PA6 value */
-    uint32_t slider_event_pin;
+    uint32_t live_adc[16];          /* Live ADC channels 0-15 */
+    uint32_t live_idr[5];           /* [0]=Port A, [1]=Port B, etc. */
+    uint32_t active_button;         /* 0=None, 1=Open/Close, 2=Add Pet, 3=Learn */
+    uint32_t slider_event_pin;      /* Slider position: 1, 2, 3 */
+
+    /* Motor & Current Sensing Diagnostics */
+    uint32_t motor_state;           /* 0=STOP, 1=OPEN, 2=CLOSE */
+    uint16_t motor_idle_adc[16];    /* Idle baseline sampled before motor start */
+    uint16_t motor_peak_adc[16];    /* Peak ADC observed during motor run */
+    int16_t  motor_diff_adc[16];    /* Max surge (peak - baseline) difference */
+    uint32_t stall_channel;         /* Channel that exhibited highest surge */
+    int16_t  stall_max_surge;       /* Value of highest surge */
+    uint32_t stall_count;           /* Number of stall cutoffs triggered */
+    uint32_t motor_stop_reason;     /* 0=released, 1=stall cutoff, 2=timeout */
+
     LogEvent events[LOG_SIZE];
 } DiagnosticLog;
 
@@ -57,10 +78,19 @@ volatile DiagnosticLog g_diag = {
     .event_count = 0,
     .head_index = 0,
     .active_button = 0,
-    .adc6_baseline = 2830,
-    .adc6_smooth = 2830,
-    .slider_event_pin = 0
+    .slider_event_pin = 0,
+    .stall_channel = 0,
+    .stall_max_surge = 0,
+    .stall_count = 0,
+    .motor_stop_reason = 0
 };
+
+/* Live tunable stall detection:
+ * - g_stall_sag_threshold: rail sag on PC4 in ADC counts (90 counts ≈ 75mV)
+ *   When motor stalls, rail drops by ~175 counts.
+ */
+volatile uint16_t g_stall_sag_threshold = 90;
+volatile uint16_t g_stall_threshold = 4096;
 
 /* Status LEDs: Both are Active LOW (RESET = ON, SET = OFF) */
 #define LED_GREEN_ON()   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_RESET)
@@ -77,6 +107,7 @@ void ADC_Init_Multi(void);
 uint16_t ADC_Read_20ms_Filter(uint32_t channel);
 uint16_t ADC_Read_Fast(uint32_t channel);
 void Log_Event(uint32_t type, uint32_t p1, uint32_t p2, uint32_t p3);
+void Motor_Set(MotorDirection dir);
 
 int main(void)
 {
@@ -87,15 +118,18 @@ int main(void)
 
     HAL_Delay(100);
 
+    /* Sample initial baseline on all 16 ADC channels */
+    for (uint32_t ch = 0; ch < 16; ch++) {
+        uint16_t v = ADC_Read_Fast(ch);
+        g_diag.live_adc[ch] = v;
+        g_diag.motor_idle_adc[ch] = v;
+    }
+
     uint16_t prev_idr_A = (uint16_t)GPIOA->IDR;
     uint16_t prev_idr_B = (uint16_t)GPIOB->IDR;
     uint16_t prev_idr_C = (uint16_t)GPIOC->IDR;
     uint16_t prev_idr_D = (uint16_t)GPIOD->IDR;
     uint16_t prev_idr_E = (uint16_t)GPIOE->IDR;
-
-    uint16_t prev_adc_4   = ADC_Read_Fast(ADC_CHANNEL_4);
-    uint16_t prev_adc_5   = ADC_Read_Fast(ADC_CHANNEL_5);
-    uint16_t prev_adc_7   = ADC_Read_Fast(ADC_CHANNEL_7);
 
     ButtonId current_btn  = BTN_NONE;
     ButtonId reported_btn = BTN_NONE;
@@ -104,9 +138,17 @@ int main(void)
     uint8_t  heartbeat_on   = 0;
 
     /* Initialize slider position */
-    uint8_t prev_slider_pos = ((GPIOB->IDR & (1 << 4)) == 0 ? 1 : ((GPIOB->IDR & (1 << 5)) == 0 ? 3 : 2));
+    uint8_t prev_slider_pos = ((GPIOB->IDR & (1 << 3)) == 0 ? 1 :
+                              ((GPIOB->IDR & (1 << 4)) == 0 ? 2 :
+                              ((GPIOB->IDR & (1 << 5)) == 0 ? 3 : 2)));
     uint8_t slider_feedback_pos = 0;
     uint32_t slider_feedback_until = 0;
+
+    /* Motor state tracking */
+    uint32_t motor_start_time = 0;
+    uint8_t  stall_latched = 0;
+    uint32_t stall_feedback_until = 0;
+    uint16_t motor_peak_pc4 = 0;
 
     while (1)
     {
@@ -125,8 +167,8 @@ int main(void)
         g_diag.live_idr[3] = cur_D;
         g_diag.live_idr[4] = cur_E;
 
-        /* Port A: Exclude Open/Close (Pin 1), Analog (Pin 6), SWD (13,14), and Red LED (15) */
-        uint16_t diff_A = (cur_A ^ prev_idr_A) & ~( (1 << 1) | (1 << 6) | (1 << 13) | (1 << 14) | (1 << 15) );
+        /* Port A: Exclude Open/Close (Pin 1), SWD (13,14), and Red LED (15) */
+        uint16_t diff_A = (cur_A ^ prev_idr_A) & ~( (1 << 1) | (1 << 13) | (1 << 14) | (1 << 15) );
         if (diff_A) {
             for (int p = 0; p < 16; p++) {
                 if (diff_A & (1 << p)) {
@@ -146,7 +188,8 @@ int main(void)
             prev_idr_B = cur_B;
         }
 
-        uint16_t diff_C = (cur_C ^ prev_idr_C) & ~( (1 << 4) | (1 << 5) | (1 << 10) );
+        /* Port C: Exclude LED (Pin 10) */
+        uint16_t diff_C = (cur_C ^ prev_idr_C) & ~(1 << 10);
         if (diff_C) {
             for (int p = 0; p < 16; p++) {
                 if (diff_C & (1 << p)) {
@@ -166,7 +209,8 @@ int main(void)
             prev_idr_D = cur_D;
         }
 
-        uint16_t diff_E = cur_E ^ prev_idr_E;
+        /* Port E: Exclude Slider Ground (Pin 4) and Motor Gates (Pins 11, 12) */
+        uint16_t diff_E = (cur_E ^ prev_idr_E) & ~( (1 << 4) | (1 << 11) | (1 << 12) );
         if (diff_E) {
             for (int p = 0; p < 16; p++) {
                 if (diff_E & (1 << p)) {
@@ -176,51 +220,21 @@ int main(void)
             prev_idr_E = cur_E;
         }
 
-        /* --- 2. Button Line on PA1 (Pin 23 / ADC_IN1) ---
-         * The 3 buttons connect between 3.3V (VDDA / Pin 22) and PA1 via resistors:
-         * SW2 (Open / Close): 2.20 kΩ -> Highest voltage (~2.5V - 3.3V)
-         * SW1 (Add Pet):     4.67 kΩ -> Middle voltage  (~1.7V - 2.5V)
-         * SW3 (Learn Mode):  7.45 kΩ -> Lowest voltage  (~0.7V - 1.6V)
-         * Idle: Motherboard pulldown keeps line near 0V
+        /* --- 2. Button Line Sampling ---
+         * When motor is STOPPED, use 20ms mains-hum integration filter.
+         * When motor is RUNNING, use high-speed single conversion for fast control loop.
          */
-        uint8_t sw_open_pin = ((cur_A & (1 << 1)) != 0);
-        uint16_t raw_1 = ADC_Read_20ms_Filter(ADC_CHANNEL_1);
+        uint16_t raw_1;
+        if (g_diag.motor_state == MOTOR_STOP) {
+            raw_1 = ADC_Read_20ms_Filter(ADC_CHANNEL_1);
+        } else {
+            raw_1 = ADC_Read_Fast(ADC_CHANNEL_1);
+        }
         g_diag.live_adc[1] = raw_1;
 
-        /* Sample candidate analog channels for slider detection */
-        uint16_t raw_4 = ADC_Read_Fast(ADC_CHANNEL_4);
-        uint16_t raw_5 = ADC_Read_Fast(ADC_CHANNEL_5);
-        uint16_t raw_6 = ADC_Read_Fast(ADC_CHANNEL_6);
-        uint16_t raw_7 = ADC_Read_Fast(ADC_CHANNEL_7);
-
-        g_diag.live_adc[4]   = raw_4;
-        g_diag.live_adc[5]   = raw_5;
-        g_diag.live_adc[6]   = raw_6;
-        g_diag.live_adc[7]   = raw_7;
-
-        /* Check for slider ADC shifts on PA4, PA5, PA7 */
-        if (abs((int)raw_4 - (int)prev_adc_4) > 150) {
-            Log_Event(2, 4, raw_4, (uint32_t)abs((int)raw_4 - (int)prev_adc_4));
-            prev_adc_4 = raw_4;
-        }
-        if (abs((int)raw_5 - (int)prev_adc_5) > 150) {
-            Log_Event(2, 5, raw_5, (uint32_t)abs((int)raw_5 - (int)prev_adc_5));
-            prev_adc_5 = raw_5;
-        }
-        if (abs((int)raw_7 - (int)prev_adc_7) > 150) {
-            Log_Event(2, 7, raw_7, (uint32_t)abs((int)raw_7 - (int)prev_adc_7));
-            prev_adc_7 = raw_7;
-        }
-
-        /* --- 3. Resolve Active Button on PA1 ---
-         * Exact measured resistor divider voltages with onboard ~2.2k pull-down:
-         * SW2 (Open / Close): 2.20 kΩ -> ~2050 counts (~1.65V) -> Solid RED
-         * SW1 (Add Pet):     4.67 kΩ -> ~1310 - 1600 counts (~1.15V) -> Solid ORANGE
-         * SW3 (Learn Mode):  7.45 kΩ -> ~650 - 770 counts (~0.58V)  -> Solid GREEN
-         * Idle: Motherboard pulldown keeps line < 300 counts (~0V)
-         */
+        /* Decode Active Button */
         ButtonId candidate_btn = BTN_NONE;
-        if (sw_open_pin || raw_1 > 1800) {
+        if (raw_1 > 1800) {
             candidate_btn = BTN_OPEN_CLOSE; /* SW2: ~2050 counts */
         } else if (raw_1 > 1000) {
             candidate_btn = BTN_ADD_PET;    /* SW1: ~1310 - 1600 counts */
@@ -233,28 +247,27 @@ int main(void)
         current_btn = candidate_btn;
         g_diag.active_button = current_btn;
 
-        /* Log button state changes */
         if (current_btn != reported_btn) {
-            Log_Event(3, current_btn, raw_1, sw_open_pin);
+            Log_Event(3, current_btn, raw_1, 0);
             reported_btn = current_btn;
+            /* If user releases button, clear the stall lockout latch */
+            if (current_btn == BTN_NONE) {
+                stall_latched = 0;
+            }
         }
 
-        /* --- 4. Decode 3-Position Slider Switch ---
-         * Position 1 (Fast Delay):   PB4 LOW -> Solid GREEN feedback (600ms)
-         * Position 2 (Medium Delay): Center  -> Solid ORANGE feedback (600ms)
-         * Position 3 (Slow Delay):   PB5 LOW -> Solid RED feedback (600ms)
-         */
+        /* --- 3. Decode 3-Position Slider Switch --- */
         uint8_t pb3 = (cur_B >> 3) & 1;
         uint8_t pb4 = (cur_B >> 4) & 1;
         uint8_t pb5 = (cur_B >> 5) & 1;
 
-        uint8_t slider_pos = 2;
-        if (pb4 == 0 || pb3 == 0) {
+        uint8_t slider_pos = prev_slider_pos;
+        if (pb3 == 0) {
             slider_pos = 1;
+        } else if (pb4 == 0) {
+            slider_pos = 2;
         } else if (pb5 == 0) {
             slider_pos = 3;
-        } else {
-            slider_pos = 2;
         }
         g_diag.slider_event_pin = (uint32_t)slider_pos;
 
@@ -265,28 +278,145 @@ int main(void)
             prev_slider_pos = slider_pos;
         }
 
-        /* --- 5. Real-Time Status LED Indication --- */
-        if (current_btn == BTN_OPEN_CLOSE) {
-            /* Open / Close -> Solid RED for entire duration of hold (UNTOUCHED) */
+        /* --- 4. Motor Drive & Real-Time Stall Current Detection ---
+         * Learn Mode (SW3) -> Drives Motor OPEN (PE11 = HIGH)
+         * Add Pet    (SW1) -> Drives Motor CLOSE (PE12 = HIGH)
+         * Automatic Stall Cutoff: Stops motor if current surge exceeds threshold.
+         */
+        MotorDirection requested_dir = MOTOR_STOP;
+        if (!stall_latched) {
+            if (current_btn == BTN_LEARN) {
+                requested_dir = MOTOR_OPEN;
+            } else if (current_btn == BTN_ADD_PET) {
+                requested_dir = MOTOR_CLOSE;
+            }
+        }
+
+        if (requested_dir != MOTOR_STOP) {
+            if (g_diag.motor_state == MOTOR_STOP) {
+                /* Starting motor: sample idle baseline across all 16 channels */
+                for (uint32_t ch = 0; ch < 16; ch++) {
+                    if (ch == 1) continue;
+                    uint16_t v = ADC_Read_Fast(ch);
+                    g_diag.live_adc[ch] = v;
+                    g_diag.motor_idle_adc[ch] = v;
+                    g_diag.motor_peak_adc[ch] = v;
+                    g_diag.motor_diff_adc[ch] = 0;
+                }
+                g_diag.stall_channel = 0;
+                g_diag.stall_max_surge = 0;
+                motor_peak_pc4 = 0;
+                motor_start_time = now;
+                Motor_Set(requested_dir);
+                g_diag.motor_state = requested_dir;
+            }
+
+            uint32_t run_duration = now - motor_start_time;
+
+            /* Safety 4.0s timeout to protect motor */
+            if (run_duration >= 4000) {
+                Motor_Set(MOTOR_STOP);
+                g_diag.motor_state = MOTOR_STOP;
+                g_diag.motor_stop_reason = 2; /* 2 = Timeout */
+                stall_latched = 1;
+            } else {
+                /* Fast multi-channel ADC scan during motor run */
+                for (uint32_t ch = 0; ch < 16; ch++) {
+                    if (ch == 1) continue; /* Skip button line */
+                    uint16_t v = ADC_Read_Fast(ch);
+                    g_diag.live_adc[ch] = v;
+
+                    if (v > g_diag.motor_peak_adc[ch]) {
+                        g_diag.motor_peak_adc[ch] = v;
+                    }
+
+                    int16_t diff = (int16_t)v - (int16_t)g_diag.motor_idle_adc[ch];
+                    if (diff > g_diag.motor_diff_adc[ch]) {
+                        g_diag.motor_diff_adc[ch] = diff;
+                    }
+
+                    /* Only evaluate stall surges AFTER the 200ms inrush blanking period */
+                    if (run_duration > 200) {
+                        if (diff > g_diag.stall_max_surge) {
+                            g_diag.stall_max_surge = diff;
+                            g_diag.stall_channel = ch;
+                        }
+                    }
+                }
+
+                /* Periodic diagnostic logging every 100ms during run:
+                 * param1 = run_duration_ms, param2 = Ch14 (PC4), param3 = Ch15 (PC5) */
+                static uint32_t last_run_log_time = 0;
+                if (now - last_run_log_time >= 100) {
+                    last_run_log_time = now;
+                    Log_Event(6, run_duration, g_diag.live_adc[14], g_diag.live_adc[15]);
+                }
+
+                /* Stall Cutoff: Detect supply rail sag on PC4 (Channel 14)
+                 * While moving freely: PC4 = 3550 ± 20
+                 * When hitting mechanical stop: PC4 plunges to 3385 (sag of ~175 counts)
+                 */
+                uint16_t pc4 = g_diag.live_adc[14];
+                if (run_duration > 200) {
+                    if (pc4 > motor_peak_pc4) {
+                        motor_peak_pc4 = pc4;
+                    }
+
+                    if ((motor_peak_pc4 >= 3450) && ((motor_peak_pc4 - pc4) >= g_stall_sag_threshold)) {
+                        /* Stall detected! Cut motor power immediately */
+                        Motor_Set(MOTOR_STOP);
+                        g_diag.motor_state = MOTOR_STOP;
+                        g_diag.motor_stop_reason = 1; /* 1 = Stall cutoff */
+                        g_diag.stall_count++;
+                        stall_latched = 1;
+                        stall_feedback_until = now + 500; /* Solid orange visual feedback */
+
+                        Log_Event(5, 14, (uint32_t)(motor_peak_pc4 - pc4), run_duration);
+                    }
+                }
+            }
+        } else {
+            /* Motor requested STOP */
+            if (g_diag.motor_state != MOTOR_STOP) {
+                Motor_Set(MOTOR_STOP);
+                g_diag.motor_state = MOTOR_STOP;
+                g_diag.motor_stop_reason = 0; /* 0 = Normal button release */
+            }
+
+            /* Periodically refresh idle ADC readings when stopped */
+            static uint32_t last_idle_adc_time = 0;
+            if (now - last_idle_adc_time >= 100) {
+                last_idle_adc_time = now;
+                for (uint32_t ch = 0; ch < 16; ch++) {
+                    if (ch == 1) continue;
+                    g_diag.live_adc[ch] = ADC_Read_Fast(ch);
+                }
+            }
+        }
+
+        /* --- 5. Status LED Indication --- */
+        if (now < stall_feedback_until) {
+            /* Stall Cutoff Feedback: Solid ORANGE / AMBER */
+            LED_RED_ON();
+            LED_GREEN_ON();
+            heartbeat_on = 0;
+        } else if (current_btn == BTN_OPEN_CLOSE) {
+            /* Open / Close -> Solid RED */
             LED_RED_ON();
             LED_GREEN_OFF();
             heartbeat_on = 0;
         } else if (current_btn == BTN_ADD_PET) {
-            /* Add Pet -> Solid ORANGE for entire duration of hold */
+            /* Add Pet -> Solid ORANGE */
             LED_RED_ON();
             LED_GREEN_ON();
             heartbeat_on = 0;
         } else if (current_btn == BTN_LEARN) {
-            /* Learn Mode -> Solid GREEN for entire duration of hold */
+            /* Learn Mode -> Solid GREEN */
             LED_RED_OFF();
             LED_GREEN_ON();
             heartbeat_on = 0;
         } else if (now < slider_feedback_until) {
-            /* Slider switch position feedback:
-             * Position 1 -> GREEN
-             * Position 2 -> ORANGE (Red + Green)
-             * Position 3 -> RED
-             */
+            /* Slider switch feedback */
             if (slider_feedback_pos == 1) {
                 LED_RED_OFF();
                 LED_GREEN_ON();
@@ -299,10 +429,8 @@ int main(void)
             }
             heartbeat_on = 0;
         } else {
-            /* Idle: Red is completely OFF */
+            /* Idle: Green Heartbeat pulse (40ms ON every 1200ms) */
             LED_RED_OFF();
-
-            /* Green Heartbeat: 1160ms OFF, 40ms ON */
             if (now - last_heartbeat >= 1200) {
                 last_heartbeat = now;
                 heartbeat_on = 1;
@@ -330,6 +458,33 @@ void Log_Event(uint32_t type, uint32_t p1, uint32_t p2, uint32_t p3)
     g_diag.event_count++;
 }
 
+static MotorDirection s_current_motor_dir = MOTOR_STOP;
+
+void Motor_Set(MotorDirection dir)
+{
+    if (dir == s_current_motor_dir) {
+        return;
+    }
+
+    if (dir == MOTOR_OPEN) {
+        /* Open: Ensure Close (PE12) is OFF first with dead-time before PE11 HIGH */
+        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_11 | GPIO_PIN_12, GPIO_PIN_RESET);
+        for (volatile int i = 0; i < 500; i++) __NOP(); /* Shoot-through dead-time */
+        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_11, GPIO_PIN_SET);
+        s_current_motor_dir = MOTOR_OPEN;
+    } else if (dir == MOTOR_CLOSE) {
+        /* Close: Ensure Open (PE11) is OFF first with dead-time before PE12 HIGH */
+        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_11 | GPIO_PIN_12, GPIO_PIN_RESET);
+        for (volatile int i = 0; i < 500; i++) __NOP(); /* Shoot-through dead-time */
+        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_12, GPIO_PIN_SET);
+        s_current_motor_dir = MOTOR_CLOSE;
+    } else {
+        /* Immediate STOP: Both pins LOW */
+        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_11 | GPIO_PIN_12, GPIO_PIN_RESET);
+        s_current_motor_dir = MOTOR_STOP;
+    }
+}
+
 void GPIO_Init_All(void)
 {
     __HAL_RCC_GPIOA_CLK_ENABLE();
@@ -345,31 +500,60 @@ void GPIO_Init_All(void)
     GPIO_InitStruct.Pull = GPIO_PULLUP;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
 
-    /* Port A (skip SWD pins PA13 & PA14, and LED pin PA15) */
-    GPIO_InitStruct.Pin = GPIO_PIN_All & ~(GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15);
+    /* Port A (skip SWD pins PA13 & PA14, LED PA15, and analog pins PA0-PA7) */
+    GPIO_InitStruct.Pin = GPIO_PIN_All & ~(GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15 | 0x00FF);
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-    /* PA1 (Pin 23): Shared Button Line - configure NOPULL so external pulldown holds line at 0V */
-    GPIO_InitStruct.Pin = GPIO_PIN_1;
-    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    /* Port A Analog Pins: PA0..PA7 in pure analog mode (no pull-up) */
+    GPIO_InitStruct.Pin = 0x00FF; /* PA0 through PA7 */
+    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-    /* Port B */
-    GPIO_InitStruct.Pin = GPIO_PIN_All;
+    /* Port B Digital Inputs: PB3, PB4, PB5 for Slider Switch */
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    GPIO_InitStruct.Pin = GPIO_PIN_All & ~(GPIO_PIN_0 | GPIO_PIN_1);
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-    /* Port C (skip motor pins PC4, PC5 and LED pin PC10) */
-    GPIO_InitStruct.Pin = GPIO_PIN_All & ~(GPIO_PIN_4 | GPIO_PIN_5 | GPIO_PIN_10);
+    /* Port B Analog Pins: PB0, PB1 */
+    GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_1;
+    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    /* Port C Digital Inputs (skip PC10 for LED and PC0-PC5 for analog) */
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    GPIO_InitStruct.Pin = GPIO_PIN_All & ~(GPIO_PIN_10 | 0x003F);
     HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-    /* Port D */
+    /* Port C Analog Pins: PC0..PC5 */
+    GPIO_InitStruct.Pin = 0x003F; /* PC0 through PC5 */
+    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+    /* Port D: All inputs with internal PULL-UP */
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
     GPIO_InitStruct.Pin = GPIO_PIN_All;
     HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
-    /* Port E */
-    GPIO_InitStruct.Pin = GPIO_PIN_All;
+    /* Port E: All inputs with PULL-UP (skip PE4 for slider ground, and PE11 & PE12 for motor) */
+    GPIO_InitStruct.Pin = GPIO_PIN_All & ~(GPIO_PIN_4 | GPIO_PIN_11 | GPIO_PIN_12);
     HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
+    /* PE4 (Pin 3): Slider Switch Common Ground Driver -> driven LOW (0V) */
+    GPIO_InitStruct.Pin = GPIO_PIN_4;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_4, GPIO_PIN_RESET);
 
     /* 2. Status LEDs: Both are Active LOW (RESET = ON, SET = OFF) */
     GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
@@ -384,11 +568,13 @@ void GPIO_Init_All(void)
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
     LED_RED_OFF();
 
-    /* 3. Motor H-Bridge: PC4 (Q501), PC5 (Q506) held safely LOW */
-    GPIO_InitStruct.Pin = GPIO_PIN_4 | GPIO_PIN_5;
+    /* 3. Motor H-Bridge: PE11 (Pin 42 - Open), PE12 (Pin 43 - Close) */
+    GPIO_InitStruct.Pin = GPIO_PIN_11 | GPIO_PIN_12;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
     GPIO_InitStruct.Pull = GPIO_PULLDOWN;
-    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_4 | GPIO_PIN_5, GPIO_PIN_RESET);
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_11 | GPIO_PIN_12, GPIO_PIN_RESET);
 }
 
 void ADC_Init_Multi(void)
@@ -413,12 +599,27 @@ void ADC_Init_Multi(void)
     HAL_ADCEx_Calibration_Start(&hadc, ADC_SINGLE_ENDED);
 }
 
+static const uint32_t s_adc_hal_channels[16] = {
+    ADC_CHANNEL_0,  ADC_CHANNEL_1,  ADC_CHANNEL_2,  ADC_CHANNEL_3,
+    ADC_CHANNEL_4,  ADC_CHANNEL_5,  ADC_CHANNEL_6,  ADC_CHANNEL_7,
+    ADC_CHANNEL_8,  ADC_CHANNEL_9,  ADC_CHANNEL_10, ADC_CHANNEL_11,
+    ADC_CHANNEL_12, ADC_CHANNEL_13, ADC_CHANNEL_14, ADC_CHANNEL_15
+};
+
+static inline uint32_t Get_HAL_Channel(uint32_t ch)
+{
+    if (ch < 16) {
+        return s_adc_hal_channels[ch];
+    }
+    return ch;
+}
+
 uint16_t ADC_Read_20ms_Filter(uint32_t channel)
 {
     hadc.Instance->CHSELR = 0;
 
     ADC_ChannelConfTypeDef sConfig = {0};
-    sConfig.Channel = channel;
+    sConfig.Channel = Get_HAL_Channel(channel);
     sConfig.Rank = ADC_RANK_CHANNEL_NUMBER;
     HAL_ADC_ConfigChannel(&hadc, &sConfig);
 
@@ -439,7 +640,7 @@ uint16_t ADC_Read_Fast(uint32_t channel)
     hadc.Instance->CHSELR = 0;
 
     ADC_ChannelConfTypeDef sConfig = {0};
-    sConfig.Channel = channel;
+    sConfig.Channel = Get_HAL_Channel(channel);
     sConfig.Rank = ADC_RANK_CHANNEL_NUMBER;
     HAL_ADC_ConfigChannel(&hadc, &sConfig);
 

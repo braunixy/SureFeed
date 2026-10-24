@@ -18,9 +18,11 @@
 | **78** | `PC10` | Green LED Cathode | **Status LED - Green** (Active LOW: LOW = ON, HIGH = OFF) |
 | **77** | `PA15` | Red LED Cathode | **Status LED - Red** (Active LOW: LOW = ON, HIGH = OFF, Green + Red = **Orange / Amber**) |
 | **23** | `PA1` (`ADC_IN1`) | Daughterboard Button Bus | **Shared Analog Button Line** (All 3 buttons: SW1, SW2, SW3 with internal/external ~2.2k pull-down) |
-| **89, 90, 91** | `PB3`, `PB4`, `PB5` | Slider Switch (Lid Delay) | **3-Position Delay Switch**: Position 1 (Fast), 2 (Medium), 3 (Slow) |
-| **33** | `PC4` | Gate Driver Q501 | **Motor Drive A** (Lid Open/Close H-Bridge) |
-| **34** | `PC5` | Gate Driver Q506 | **Motor Drive B** (Lid Open/Close H-Bridge) |
+| **89, 90, 91** | `PB3`, `PB4`, `PB5` | Slider Switch Throws (Inputs) | **3-Position Delay Switch Sense**: PB3 = Pos 1 (Fast), PB4 = Pos 2 (Medium), PB5 = Pos 3 (Slow) |
+| **3** | `PE4` | Slider Switch Wiper (Drive LOW) | **Active Ground Return Rail** (Driven LOW / 0V by MCU) |
+| **42** | `PE11` | Gate Driver / H-Bridge A | **Motor Drive A** (Lid Open Direction) |
+| **43** | `PE12` | Gate Driver / H-Bridge B | **Motor Drive B** (Lid Close Direction) |
+| **33** | `PC4` (`ADC_IN14`) | H-Bridge Supply Rail Sense | **Motor Current / Supply Sag Monitor** (Detects stall cutoff via rail voltage sag) |
 | **76** | `PA14` | SWCLK / Debug Header | **SWD Clock** (Serial Wire Debug) |
 | **72** | `PA13` | SWDIO / Debug Header | **SWD Data I/O** (Serial Wire Debug) |
 | **14** | `NRST` | Reset Pad / Pushbutton | **Target Hardware Reset** (Active Low) |
@@ -73,20 +75,24 @@ The user controls on the daughterboard connect via a 5-pin ribbon cable:
     * **Idle (Released):** **$0\text{V}$ ($< 300\text{ ADC counts}$)** $\rightarrow$ Heartbeat Green pulse, Red OFF.
 * **Slider Switch (Lid Delay):**
   * 3-position slider switch located on the main board / chassis (Delay 1, 2, 3).
-  * Wired to **`PB3`**, **`PB4`**, and **`PB5`** (Port B digital inputs).
+  * **Wiper / Common Pin:** Connected to **`PE4`** (Pin 3), driven LOW (`0V`) by the MCU as an active ground rail.
+  * **Position 1 (Fast Delay):** Shorts `PE4` to **`PB3`** $\rightarrow$ `PB3` reads `0` (LOW) $\rightarrow$ **Solid GREEN**
+  * **Position 2 (Medium Delay):** Shorts `PE4` to **`PB4`** $\rightarrow$ `PB4` reads `0` (LOW) $\rightarrow$ **Solid ORANGE**
+  * **Position 3 (Slow Delay):** Shorts `PE4` to **`PB5`** $\rightarrow$ `PB5` reads `0` (LOW) $\rightarrow$ **Solid RED**
 
-### 3.3 Motor Drive & Lid Mechanism
+### 3.3 Motor Drive & Lid Mechanism (100% Reverse Engineered & Verified)
 * **H-Bridge Control:** Discrete N-MOSFET / P-MOSFET bridge:
-  * **`PC4`** (Pin 33) drives Q501 (Forward / Open).
-  * **`PC5`** (Pin 34) drives Q506 (Reverse / Close).
-  * **Safety:** Both pins must NEVER be high simultaneously (dead-time must be respected to prevent shoot-through).
-* **Limit Switch Mystery Solved:**
+  * **`PE11`** (Pin 42) drives Forward / Open.
+  * **`PE12`** (Pin 43) drives Reverse / Close.
+  * **Safety:** Both pins must NEVER be high simultaneously (shoot-through dead-time strictly enforced in software).
+* **Limitless Mechanical Design & Stall-Current Detection:**
   * The feeder has **NO mechanical limit switches, optical interrupters, or rotary encoders** on the lid or gearbox.
-  * The feeder uses **Motor Stall-Current Detection**:
-    1. The MCU energizes the motor in the desired direction.
-    2. The lid travels until it physically contacts the mechanical end-stop (fully open or fully closed).
-    3. The motor stalls, causing a sharp current surge across an on-board shunt resistor.
-    4. The MCU analog comparator / ADC detects the current spike and immediately cuts power to the motor.
+  * It employs dynamic **Supply Rail Voltage-Sag Stall Detection** via **`PC4` (`ADC_IN14`, Pin 33)**:
+    1. **Idle State:** Motor OFF $\rightarrow$ `PC4` reads $0\text{V}$ ($15\text{ ADC counts}$).
+    2. **Startup Blanking:** During the first $200\text{ ms}$, inrush motor starting current is blanked out.
+    3. **Free Travel:** While the lid is moving freely, the motor draws $\sim 100\text{ mA}$, holding `PC4` at $\sim 2.86\text{V}$ ($3550 \pm 20\text{ ADC counts}$).
+    4. **Mechanical End-Stop (Stall):** When the lid reaches fully open or fully closed, the motor stalls and current jumps to $\sim 1.0\text{ A}$. The battery/inductor internal resistance causes the supply rail to immediately plunge to $\sim 2.72\text{V}$ ($3385\text{ counts}$ — a sharp $\sim 175\text{ count}$ sag).
+    5. **Automated Cutoff:** Calibrated with a `90 count` threshold ($\sim 75\text{ mV}$ sag). Cutoff triggers within milliseconds of contacting the end-stop, instantly cutting H-bridge drive and lighting solid Amber LED feedback.
 
 ---
 
