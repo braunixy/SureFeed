@@ -99,6 +99,16 @@ volatile uint16_t g_stall_threshold = 4096;
 #define LED_RED_ON()     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_15, GPIO_PIN_RESET)
 #define LED_RED_OFF()    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_15, GPIO_PIN_SET)
 
+/* IR Emitter LEDs: PC6 (Pin 63 - IR LED 1 via Q807), PC7 (Pin 64 - IR LED 2 via Q806)
+ * Driving HIGH turns on the N-channel transistor, sinking cathode to GND -> LED ON.
+ */
+#define IR_LEDS_ON()     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6 | GPIO_PIN_7, GPIO_PIN_SET)
+#define IR_LEDS_OFF()    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6 | GPIO_PIN_7, GPIO_PIN_RESET)
+#define IR_LED1_ON()     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_SET)
+#define IR_LED1_OFF()    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_RESET)
+#define IR_LED2_ON()     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_SET)
+#define IR_LED2_OFF()    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_RESET)
+
 ADC_HandleTypeDef hadc;
 
 void SystemClock_Config(void);
@@ -394,6 +404,22 @@ int main(void)
             }
         }
 
+        /* --- IR LED Test: Alternate LED1 and LED2 every 500ms ---
+         * Pulsing one LED at a time provides 2x higher current through R820
+         * and makes the blink easily visible on camera and multimeter!
+         */
+        static uint32_t last_ir_cycle = 0;
+        if (now - last_ir_cycle >= 1000) {
+            last_ir_cycle = now;
+        }
+        if (now - last_ir_cycle < 500) {
+            IR_LED1_ON();
+            IR_LED2_OFF();
+        } else {
+            IR_LED1_OFF();
+            IR_LED2_ON();
+        }
+
         /* --- 5. Status LED Indication --- */
         if (now < stall_feedback_until) {
             /* Stall Cutoff Feedback: Solid ORANGE / AMBER */
@@ -523,11 +549,11 @@ void GPIO_Init_All(void)
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-    /* Port C Digital Inputs (skip PC10 for LED and PC0-PC5 for analog) */
+    /* Port C Digital Inputs (skip PC6, PC7 for IR LEDs, PC10 for LED, and PC0-PC5 for analog) */
     GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
     GPIO_InitStruct.Pull = GPIO_PULLUP;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-    GPIO_InitStruct.Pin = GPIO_PIN_All & ~(GPIO_PIN_10 | 0x003F);
+    GPIO_InitStruct.Pin = GPIO_PIN_All & ~(GPIO_PIN_6 | GPIO_PIN_7 | GPIO_PIN_10 | 0x003F);
     HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
     /* Port C Analog Pins: PC0..PC5 */
@@ -575,6 +601,14 @@ void GPIO_Init_All(void)
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
     HAL_GPIO_WritePin(GPIOE, GPIO_PIN_11 | GPIO_PIN_12, GPIO_PIN_RESET);
+
+    /* 4. IR Emitter LEDs: PC6 (Pin 63 - IR LED 1 via Q807), PC7 (Pin 64 - IR LED 2 via Q806) */
+    GPIO_InitStruct.Pin = GPIO_PIN_6 | GPIO_PIN_7;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+    IR_LEDS_ON(); /* Turn ON both IR LEDs continuously for test */
 }
 
 void ADC_Init_Multi(void)

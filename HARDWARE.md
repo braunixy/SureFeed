@@ -23,6 +23,8 @@
 | **42** | `PE11` | Gate Driver / H-Bridge A | **Motor Drive A** (Lid Open Direction) |
 | **43** | `PE12` | Gate Driver / H-Bridge B | **Motor Drive B** (Lid Close Direction) |
 | **33** | `PC4` (`ADC_IN14`) | H-Bridge Supply Rail Sense | **Motor Current / Supply Sag Monitor** (Detects stall cutoff via rail voltage sag) |
+| **63** | `PC6` (`TIM22_CH1` / `TIM3_CH1`) | Gate Driver `Q807` via `R825` ($220\ \Omega$) | **IR Pet Arch Emitter LED 1** (Active HIGH: drives Q807 to sink cathode) |
+| **64** | `PC7` (`TIM22_CH2` / `TIM3_CH2`) | Gate Driver `Q806` via `R821` ($220\ \Omega$) | **IR Pet Arch Emitter LED 2** (Active HIGH: drives Q806 to sink cathode) |
 | **76** | `PA14` | SWCLK / Debug Header | **SWD Clock** (Serial Wire Debug) |
 | **72** | `PA13` | SWDIO / Debug Header | **SWD Data I/O** (Serial Wire Debug) |
 | **14** | `NRST` | Reset Pad / Pushbutton | **Target Hardware Reset** (Active Low) |
@@ -94,10 +96,21 @@ The user controls on the daughterboard connect via a 5-pin ribbon cable:
     4. **Mechanical End-Stop (Stall):** When the lid reaches fully open or fully closed, the motor stalls and current jumps to $\sim 1.0\text{ A}$. The battery/inductor internal resistance causes the supply rail to immediately plunge to $\sim 2.72\text{V}$ ($3385\text{ counts}$ — a sharp $\sim 175\text{ count}$ sag).
     5. **Automated Cutoff:** Calibrated with a `90 count` threshold ($\sim 75\text{ mV}$ sag). Cutoff triggers within milliseconds of contacting the end-stop, instantly cutting H-bridge drive and lighting solid Amber LED feedback.
 
+### 3.4 IR Pet Arch Emitter (100% Reverse Engineered & Verified)
+* **Emitter Circuit Topology:** Common-Anode Low-Side Switched 940nm Dual IR LEDs:
+  * **Common Anode Rail:** Middle wire supplied from `VDD` ($3.3\text{V}$) via ballast resistor `R820`.
+  * **IR LED 1 (Cathode):** Left wire connected to collector/drain of `Q807`.
+    * Driven by **`PC6`** (Pin 63, `TIM22_CH1` / `TIM3_CH1`) via base resistor `R825` ($220\ \Omega$).
+    * Active HIGH: driving `PC6 = HIGH` switches `Q807` ON, pulling cathode to GND ($\sim 0.4\text{V}$) $\rightarrow$ LED 1 lights up.
+  * **IR LED 2 (Cathode):** Right wire connected to collector/drain of `Q806`.
+    * Driven by **`PC7`** (Pin 64, `TIM22_CH2` / `TIM3_CH2`) via base resistor `R821` ($220\ \Omega$).
+    * Active HIGH: driving `PC7 = HIGH` switches `Q806` ON, pulling cathode to GND ($\sim 0.4\text{V}$) $\rightarrow$ LED 2 lights up.
+  * **Wavelength & Forward Voltage:** 940nm near-infrared with measured $V_F = 1.1\text{V}$.
+
 ---
 
 ## 4. Work in Progress (Upcoming Subsystems)
+* **IR Pet Barrier Gate (Receivers):** 4-wire phototransistor array in the archway opposite the emitters to detect beam interruption.
 * **RFID Transceiver:** 134.2 kHz carrier generator (PWM timer) and envelope receiver/comparator for ISO 11784/11785 FDX-B pet microchip decoding.
-* **IR Pet Barrier Gate:** Dual infrared emitter and phototransistor beam array in the archway to detect pet head presence and prevent lid closure while feeding.
 * **Battery Voltage Monitor:** ADC resistor divider monitoring 4× C-cell battery health (nominal 6.0V down to 4.0V cutoff).
 
