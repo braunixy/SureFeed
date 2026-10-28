@@ -162,6 +162,7 @@ static uint32_t motor_start_time = 0;
 static uint16_t motor_peak_pc4 = 0;
 static uint32_t stall_feedback_until = 0;
 static uint32_t pet_clear_time = 0;
+static uint32_t last_run_log_time = 0;
 
 void SystemClock_Config(void);
 void GPIO_Init_All(void);
@@ -583,9 +584,11 @@ int main(void)
             prev_slider_pos = slider_pos;
         }
 
-        /* --- 5. Dual-Channel Time-Division Multiplexed Break-Beam Detection --- */
+        /* --- 5. Dual-Channel Time-Division Multiplexed Break-Beam Detection ---
+         * Only sample when not actively opening to keep opening motion fast and continuous.
+         */
         static uint32_t last_ir_time = 0;
-        if (now - last_ir_time >= 50) {
+        if (g_diag.lid_state != LID_OPENING && (now - last_ir_time >= 50)) {
             IR_Sample_Pulsed();
             now = HAL_GetTick();
             last_ir_time = now;
@@ -624,13 +627,13 @@ int main(void)
 
         /* --- 7. Motor Motion Supervision & Real-Time Stall Cutoff --- */
         if (g_diag.lid_state == LID_OPENING || g_diag.lid_state == LID_CLOSING) {
-            uint32_t run_duration = now - motor_start_time;
+            now = HAL_GetTick();
+            uint32_t run_duration = (now >= motor_start_time) ? (now - motor_start_time) : 0;
             uint16_t pc4 = ADC_Read_Fast(14);
             g_diag.live_adc[14] = pc4;
 
             /* Periodic diagnostic logging every 100ms during run */
-            static uint32_t last_run_log_time = 0;
-            if (now - last_run_log_time >= 100) {
+            if (run_duration > 0 && (now - last_run_log_time >= 100)) {
                 last_run_log_time = now;
                 Log_Event(6, run_duration, pc4, g_diag.lid_state);
             }
@@ -751,6 +754,13 @@ void Motor_Drive(MotorDirection dir, uint32_t duty_pct)
 
     s_target_duty_pct = duty_pct;
     s_target_motor_dir = dir;
+
+    /* Drive active direction pin immediately */
+    if (dir == MOTOR_OPEN) {
+        GPIOE->BSRR = ((uint32_t)GPIO_PIN_12 << 16U) | GPIO_PIN_11;
+    } else if (dir == MOTOR_CLOSE) {
+        GPIOE->BSRR = ((uint32_t)GPIO_PIN_11 << 16U) | GPIO_PIN_12;
+    }
 }
 
 void Motor_Set(MotorDirection dir)
@@ -764,6 +774,7 @@ void Lid_Start_Opening(LidState target_mode)
     g_diag.lid_state = LID_OPENING;
     motor_start_time = HAL_GetTick();
     motor_peak_pc4 = 0;
+    last_run_log_time = motor_start_time;
     Motor_Drive(MOTOR_OPEN, g_diag.motor_speed_pct);
     g_diag.motor_state = MOTOR_OPEN;
     Log_Event(6, 1, target_mode, g_diag.motor_speed_pct);
@@ -774,6 +785,7 @@ void Lid_Start_Closing(void)
     g_diag.lid_state = LID_CLOSING;
     motor_start_time = HAL_GetTick();
     motor_peak_pc4 = 0;
+    last_run_log_time = motor_start_time;
     Motor_Drive(MOTOR_CLOSE, g_diag.motor_speed_pct);
     g_diag.motor_state = MOTOR_CLOSE;
     Log_Event(6, 2, 0, g_diag.motor_speed_pct);
