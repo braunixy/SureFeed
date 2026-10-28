@@ -111,23 +111,32 @@ The user controls on the daughterboard connect via a 5-pin ribbon cable:
 
 ### 3.5 IR Pet Arch Receiver — Dual 2-Stage Differentiated Pulse Amplifiers (100% Reverse Engineered & Verified)
 * **Power Regulation & High-Side Switch (`IC301` & `Q801`):**
-  * **`IC301` (`AABK LJ21` SOT-23-3):** Dedicated LDO voltage regulator fed from the $+5.98\text{V}$ battery rail (`Pin 2`, `C302`), `Pin 1` = `VSS`, outputting regulated voltage on `Pin 3` (`C301`) through series resistor `R801` ($220\ \Omega$) to reservoir capacitor `C801`.
+  * **`IC301` (`AABK LJ21` SOT-23-3):** Dedicated ultra-low quiescent LDO voltage regulator fed from the $+5.98\text{V}$ battery rail (`Pin 2`, `C302`), `Pin 1` = `VSS`, outputting regulated voltage on `Pin 3` (`C301`) through series filter resistor `R801` ($220\ \Omega$) to reservoir capacitor `C801`.
   * **`Q801` (`13W` / `3W` SOT-23-3, controlled by `PC8` / Pin 65):** Active-LOW high-side power switch. Driving `PC8 = LOW` ($0\text{V}$) turns `Q801` ON, energizing switched supply rail **`NET 7` ($V_{\text{CC\_IR}}$)** on `Q801.3` (decoupled by `C816`, `C844`, `C815`).
-  * **`D801` (`JG` / BAV99 Dual Series Diode):** Drops `NET 7` (`Pin 1`) to bias the top of both $22\text{ k}\Omega$ photodiode pull-up resistors `R811` and `R802` (`Pin 3`) and feeds the emitter charging rail (`Pin 2` / `C814`).
-* **Dual Symmetric 2-Stage AC Differentiating Amplifiers ($484\times$ High-Frequency Pulse Gain):**
+  * **`D801` (`JG` / BAV99 Dual Series Diode):** Drops `NET 7` (`Pin 1`) to provide the DC bias node `NET 17` (`Pin 3`) feeding the top of both $22\text{ k}\Omega$ photodiode pull-up resistors `R811` and `R802`, and couples via `Pin 2` (`C814.1`) to the emitter charging rail `NET 9` feeding `R820` ($1.0\text{ k}\Omega$) and reservoir cap `C812`.
+* **Dual Symmetric 2-Stage AC Differentiating Amplifiers ($484\times$ High-Frequency AC Gain):**
   * **Channel A (`PAD_L` $\rightarrow$ `Q804` $\rightarrow$ `Q805` $\rightarrow$ `PB1` / Pin 36 / `ADC_IN9`):**
-    * `PAD_L` connects via ferrite bead `L802`, EMI cap `C818`, and $22\text{ k}\Omega$ pull-up `R811`, AC-coupled through C0G/NP0 capacitor `C807` into `Q804` (`1GW` / BC847C) base (biased by `R812` = $220\text{k}$ [$560\text{k}$ in-circuit] to `NET 7` and `R813` = $1\text{M}$ [$530\text{k}$ in-circuit] to `VSS`).
+    * Sensor pull-up: `R811` = $22\text{ k}\Omega$ to `D801.3` (`L802` ferrite bead, `C818` EMI filter cap to `VSS`), AC-coupled through pale-grey Class-I C0G/NP0 capacitor `C807` into `Q804` (`1GW` / BC847C) base (biased by `R812` = $220\text{k}$ [$560\text{k}$ in-circuit] to `NET 7` and `R813` = $1\text{M}$ [$530\text{k}$ in-circuit] to `VSS`).
     * **Stage 1 (`Q804`):** Collector load `R814` ($33\text{ k}\Omega$) $\parallel$ `C808` to `NET 7`; Emitter DC resistor `R815` ($22\text{ k}\Omega$) to $1.66\text{V}$ bias rail (`NET 20`) $\parallel$ AC gain branch `R816` ($1.5\text{ k}\Omega$) + `C838`.
     * **Stage 2 (`Q805`):** Base driven directly by `Q804.3`; Collector load `R817` ($33\text{ k}\Omega$) $\parallel$ `C810` to `NET 7` outputting to **`PB1` (`ADC_IN9`)**; Emitter DC resistor `R818` ($33\text{ k}\Omega$) to `NET 20` $\parallel$ AC gain branch `R819` ($1.5\text{ k}\Omega$) + `C811` to `VSS`.
   * **Channel B (`PAD_R` $\rightarrow$ `Q802` $\rightarrow$ `Q803` $\rightarrow$ `PB0` / Pin 35 / `ADC_IN8`):**
     * Exact mirror twin: `PAD_R` ($22\text{ k}\Omega$ pull-up `R802`, EMI cap `C817`) $\xrightarrow{\text{C802}}$ `Q802` (`R803`/`R804` base bias, `R805` = $33\text{ k}\Omega \parallel \text{C803}$ collector, `R806` = $22\text{ k}\Omega$, `R807` = $1.5\text{ k}\Omega + \text{C804}$ emitter) $\rightarrow$ `Q803` (`R808` = $33\text{ k}\Omega \parallel \text{C805}$ collector, `R809` = $33\text{ k}\Omega$, `R827` = $1.5\text{ k}\Omega + \text{C806}$ emitter) outputting to **`PB0` (`ADC_IN8`)**.
-* **Synchronous $300\ \mu\text{s}$ Double-Edge Matched Filter Demodulation:**
-  * Because `C807`/`C802` and `C808`/`C803`/`C805` are low-capacitance Class-I C0G/NP0 capacitors, the 2-stage amplifier acts as a fast edge differentiator whose output peaks within the **first $0\text{--}15\ \mu\text{s}$** of each optical transition and returns to the $2860\text{-count}$ ($2.30\text{V}$) baseline within $75\ \mu\text{s}$:
-    * **Turn-ON Edge ($t = 0\text{..}11\ \mu\text{s}$):** Sharp negative spike (`PB0` plunges from $\sim 2865$ to $\sim 2055$ [$\Delta_{\text{ON}} \approx -810\text{ counts}$]; `PB1` plunges from $\sim 2860$ to $\sim 1740$ [$\Delta_{\text{ON}} \approx -1,120\text{ counts}$]).
-    * **Turn-OFF Edge ($t = 300\text{..}311\ \mu\text{s}$):** Sharp positive recoil spike (`PB0` jumps to $\sim 3350$ [$\Delta_{\text{OFF}} \approx +485\text{ counts}$]; `PB1` jumps to $\sim 3470$ [$\Delta_{\text{OFF}} \approx +610\text{ counts}$]).
-    * **Combined Double-Edge Matched Output ($\Delta_{\text{drop\_on}} + \Delta_{\text{jump\_off}}$):**
-      * **Beam 1 (`PC6` $\rightarrow$ `PB0` / `ADC_IN8`):** **`+1,100 to +1,300 counts`** when clear; drops $< 650\text{ counts}$ when obstructed.
-      * **Beam 2 (`PC7` $\rightarrow$ `PB1` / `ADC_IN9`):** **`+1,680 to +1,780 counts`** when clear; drops $< 900\text{ counts}$ when obstructed.
+* **Critical Design Insights for Firmware Engineers:**
+  1. **Fast Edge Differentiation (`0–15 µs` Window):**
+     * The input coupling capacitors (`C807`, `C802`) and collector filter capacitors (`C808`, `C803`, `C805`) are low-capacitance Class-I C0G/NP0 dielectric ceramic capacitors ($\sim 220\text{ pF to }1\text{ nF}$).
+     * Consequently, the 2-stage amplifier acts as an **edge differentiator with a $\sim 30\ \mu\text{s}$ time constant**. It does **NOT** maintain a DC deflection during continuous illumination.
+     * The peak optical response occurs strictly within the **first $0\text{--}15\ \mu\text{s}$** following an emitter transition! By $t = +75\ \mu\text{s}$, the output has completely returned to its $2860\text{-count}$ ($2.30\text{V}$) quiescent baseline.
+     * Attempting to sample at $600\ \mu\text{s}$ or milliseconds after pulse onset measures zero optical pulse and captures only ambient room lighting noise.
+  2. **Double-Edge Matched Filter Architecture:**
+     * **Turn-ON Edge ($t = 0\text{..}11\ \mu\text{s}$):** Sinking photodiode current creates a negative voltage pulse at the output (`PB0` plunges by $\sim 810\text{ counts}$; `PB1` plunges by $\sim 1,120\text{ counts}$).
+     * **Turn-OFF Edge ($t = 300\text{..}311\ \mu\text{s}$):** Emitter turn-off produces an equal and opposite positive recoil spike (`PB0` jumps by $\sim 485\text{ counts}$; `PB1` jumps by $\sim 610\text{ counts}$).
+     * Firmware evaluates both edges: $\Delta_{\text{matched}} = (v_{\text{pre}} - v_{\text{on\_edge}}) + (v_{\text{off\_edge}} - v_{\text{mid}})$. Requiring both edges to be valid ($>100\text{ counts}$) creates an ambient noise barrier that renders the detector immune to 50 Hz/100 Hz room light flicker and shadow artifacts.
+  3. **Mains Quiet Half-Cycle Synchronization:**
+     * In rooms with 50 Hz / 60 Hz half-wave rectified LED lighting, ambient illumination produces high-frequency switching bursts during one half of each AC cycle ($9.5\text{ ms}$) and complete dark silence during the other ($10.5\text{ ms}$).
+     * Syncing the $300\ \mu\text{s}$ pulse capture to start within the quiet half-cycle guarantees clean, jitter-free optical measurements with $>500\text{ counts}$ of headroom against false triggers.
+  4. **Empirical Operating Values & Thresholds:**
+     * **Beam 1 (`PC6` $\rightarrow$ `PB0` / `ADC_IN8`):** Clear $\approx 1,100\text{ to }1,300\text{ counts}$; Blocked threshold = **`650 counts`**.
+     * **Beam 2 (`PC7` $\rightarrow$ `PB1` / `ADC_IN9`):** Clear $\approx 1,680\text{ to }1,780\text{ counts}$; Blocked threshold = **`900 counts`**.
 
 ---
 
