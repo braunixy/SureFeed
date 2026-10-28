@@ -25,6 +25,8 @@
 | **33** | `PC4` (`ADC_IN14`) | H-Bridge Supply Rail Sense | **Motor Current / Supply Sag Monitor** (Detects stall cutoff via rail voltage sag) |
 | **63** | `PC6` (`TIM22_CH1` / `TIM3_CH1`) | Gate Driver `Q807` via `R825` ($220\ \Omega$) | **IR Pet Arch Emitter LED 1** (Active HIGH: drives Q807 to sink cathode) |
 | **64** | `PC7` (`TIM22_CH2` / `TIM3_CH2`) | Gate Driver `Q806` via `R821` ($220\ \Omega$) | **IR Pet Arch Emitter LED 2** (Active HIGH: drives Q806 to sink cathode) |
+| **65** | `PC8` | Gate Driver `Q801` | **IR Receiver Gate / Enable** (Active LOW: 0V enables receiver, 3.3V clamps to GND) |
+| **35** | `PB0` (`ADC_IN8`) | Demodulator Output via `R808` / `IC301` | **IR Receiver Analog Signal** (Pulsed transimpedance optical voltage drop) |
 | **76** | `PA14` | SWCLK / Debug Header | **SWD Clock** (Serial Wire Debug) |
 | **72** | `PA13` | SWDIO / Debug Header | **SWD Data I/O** (Serial Wire Debug) |
 | **14** | `NRST` | Reset Pad / Pushbutton | **Target Hardware Reset** (Active Low) |
@@ -97,20 +99,40 @@ The user controls on the daughterboard connect via a 5-pin ribbon cable:
     5. **Automated Cutoff:** Calibrated with a `90 count` threshold ($\sim 75\text{ mV}$ sag). Cutoff triggers within milliseconds of contacting the end-stop, instantly cutting H-bridge drive and lighting solid Amber LED feedback.
 
 ### 3.4 IR Pet Arch Emitter (100% Reverse Engineered & Verified)
-* **Emitter Circuit Topology:** Common-Anode Low-Side Switched 940nm Dual IR LEDs:
-  * **Common Anode Rail:** Middle wire supplied from `VDD` ($3.3\text{V}$) via ballast resistor `R820`.
-  * **IR LED 1 (Cathode):** Left wire connected to collector/drain of `Q807`.
-    * Driven by **`PC6`** (Pin 63, `TIM22_CH1` / `TIM3_CH1`) via base resistor `R825` ($220\ \Omega$).
-    * Active HIGH: driving `PC6 = HIGH` switches `Q807` ON, pulling cathode to GND ($\sim 0.4\text{V}$) $\rightarrow$ LED 1 lights up.
-  * **IR LED 2 (Cathode):** Right wire connected to collector/drain of `Q806`.
-    * Driven by **`PC7`** (Pin 64, `TIM22_CH2` / `TIM3_CH2`) via base resistor `R821` ($220\ \Omega$).
-    * Active HIGH: driving `PC7 = HIGH` switches `Q806` ON, pulling cathode to GND ($\sim 0.4\text{V}$) $\rightarrow$ LED 2 lights up.
+* **Emitter Circuit Topology:** Common-Anode Capacitor-Discharge Switched 940nm Dual IR LEDs:
+  * **Common Anode Rail (`C812` Reservoir):** Middle red wire supplied from the switched receiver/emitter rail (`D801.2` / `C814.1`) via $1.0\text{ k}\Omega$ charging resistor `R820` (`01B`) into reservoir capacitor `C812` (with $4.7\text{ k}\Omega$ parallel bleed resistors `R826` / `R822`).
+  * **IR LED 1 (Cathode):** Left wire connected to collector of `Q807` (`6CW` / BC817-40 NPN).
+    * Driven by **`PC6`** (Pin 63, `TIM22_CH1` / `TIM3_CH1`) via base resistor `R825` ($220\ \Omega$, `221`) and base-emitter pull-down `R824` (`470`).
+    * Active HIGH: driving `PC6 = HIGH` switches `Q807` ON, discharging `C812` through IR LED 1 into `PB0` (`ADC_IN8`) primary receiver.
+  * **IR LED 2 (Cathode):** Right wire connected to collector of `Q806` (`6CW` / BC817-40 NPN).
+    * Driven by **`PC7`** (Pin 64, `TIM22_CH2` / `TIM3_CH2`) via base resistor `R821` ($220\ \Omega$, `221`) and base-emitter pull-down `R823` (`470`).
+    * Active HIGH: driving `PC7 = HIGH` switches `Q806` ON, discharging `C812` through IR LED 2 into `PB1` (`ADC_IN9`) primary receiver.
   * **Wavelength & Forward Voltage:** 940nm near-infrared with measured $V_F = 1.1\text{V}$.
+
+### 3.5 IR Pet Arch Receiver — Dual 2-Stage Differentiated Pulse Amplifiers (100% Reverse Engineered & Verified)
+* **Power Regulation & High-Side Switch (`IC301` & `Q801`):**
+  * **`IC301` (`AABK LJ21` SOT-23-3):** Dedicated LDO voltage regulator fed from the $+5.98\text{V}$ battery rail (`Pin 2`, `C302`), `Pin 1` = `VSS`, outputting regulated voltage on `Pin 3` (`C301`) through series resistor `R801` ($220\ \Omega$) to reservoir capacitor `C801`.
+  * **`Q801` (`13W` / `3W` SOT-23-3, controlled by `PC8` / Pin 65):** Active-LOW high-side power switch. Driving `PC8 = LOW` ($0\text{V}$) turns `Q801` ON, energizing switched supply rail **`NET 7` ($V_{\text{CC\_IR}}$)** on `Q801.3` (decoupled by `C816`, `C844`, `C815`).
+  * **`D801` (`JG` / BAV99 Dual Series Diode):** Drops `NET 7` (`Pin 1`) to bias the top of both $22\text{ k}\Omega$ photodiode pull-up resistors `R811` and `R802` (`Pin 3`) and feeds the emitter charging rail (`Pin 2` / `C814`).
+* **Dual Symmetric 2-Stage AC Differentiating Amplifiers ($484\times$ High-Frequency Pulse Gain):**
+  * **Channel A (`PAD_L` $\rightarrow$ `Q804` $\rightarrow$ `Q805` $\rightarrow$ `PB1` / Pin 36 / `ADC_IN9`):**
+    * `PAD_L` connects via ferrite bead `L802`, EMI cap `C818`, and $22\text{ k}\Omega$ pull-up `R811`, AC-coupled through C0G/NP0 capacitor `C807` into `Q804` (`1GW` / BC847C) base (biased by `R812` = $220\text{k}$ [$560\text{k}$ in-circuit] to `NET 7` and `R813` = $1\text{M}$ [$530\text{k}$ in-circuit] to `VSS`).
+    * **Stage 1 (`Q804`):** Collector load `R814` ($33\text{ k}\Omega$) $\parallel$ `C808` to `NET 7`; Emitter DC resistor `R815` ($22\text{ k}\Omega$) to $1.66\text{V}$ bias rail (`NET 20`) $\parallel$ AC gain branch `R816` ($1.5\text{ k}\Omega$) + `C838`.
+    * **Stage 2 (`Q805`):** Base driven directly by `Q804.3`; Collector load `R817` ($33\text{ k}\Omega$) $\parallel$ `C810` to `NET 7` outputting to **`PB1` (`ADC_IN9`)**; Emitter DC resistor `R818` ($33\text{ k}\Omega$) to `NET 20` $\parallel$ AC gain branch `R819` ($1.5\text{ k}\Omega$) + `C811` to `VSS`.
+  * **Channel B (`PAD_R` $\rightarrow$ `Q802` $\rightarrow$ `Q803` $\rightarrow$ `PB0` / Pin 35 / `ADC_IN8`):**
+    * Exact mirror twin: `PAD_R` ($22\text{ k}\Omega$ pull-up `R802`, EMI cap `C817`) $\xrightarrow{\text{C802}}$ `Q802` (`R803`/`R804` base bias, `R805` = $33\text{ k}\Omega \parallel \text{C803}$ collector, `R806` = $22\text{ k}\Omega$, `R807` = $1.5\text{ k}\Omega + \text{C804}$ emitter) $\rightarrow$ `Q803` (`R808` = $33\text{ k}\Omega \parallel \text{C805}$ collector, `R809` = $33\text{ k}\Omega$, `R827` = $1.5\text{ k}\Omega + \text{C806}$ emitter) outputting to **`PB0` (`ADC_IN8`)**.
+* **Synchronous $300\ \mu\text{s}$ Double-Edge Matched Filter Demodulation:**
+  * Because `C807`/`C802` and `C808`/`C803`/`C805` are low-capacitance Class-I C0G/NP0 capacitors, the 2-stage amplifier acts as a fast edge differentiator whose output peaks within the **first $0\text{--}15\ \mu\text{s}$** of each optical transition and returns to the $2860\text{-count}$ ($2.30\text{V}$) baseline within $75\ \mu\text{s}$:
+    * **Turn-ON Edge ($t = 0\text{..}11\ \mu\text{s}$):** Sharp negative spike (`PB0` plunges from $\sim 2865$ to $\sim 2055$ [$\Delta_{\text{ON}} \approx -810\text{ counts}$]; `PB1` plunges from $\sim 2860$ to $\sim 1740$ [$\Delta_{\text{ON}} \approx -1,120\text{ counts}$]).
+    * **Turn-OFF Edge ($t = 300\text{..}311\ \mu\text{s}$):** Sharp positive recoil spike (`PB0` jumps to $\sim 3350$ [$\Delta_{\text{OFF}} \approx +485\text{ counts}$]; `PB1` jumps to $\sim 3470$ [$\Delta_{\text{OFF}} \approx +610\text{ counts}$]).
+    * **Combined Double-Edge Matched Output ($\Delta_{\text{drop\_on}} + \Delta_{\text{jump\_off}}$):**
+      * **Beam 1 (`PC6` $\rightarrow$ `PB0` / `ADC_IN8`):** **`+1,100 to +1,300 counts`** when clear; drops $< 650\text{ counts}$ when obstructed.
+      * **Beam 2 (`PC7` $\rightarrow$ `PB1` / `ADC_IN9`):** **`+1,680 to +1,780 counts`** when clear; drops $< 900\text{ counts}$ when obstructed.
 
 ---
 
 ## 4. Work in Progress (Upcoming Subsystems)
-* **IR Pet Barrier Gate (Receivers):** 4-wire phototransistor array in the archway opposite the emitters to detect beam interruption.
+* **Single-Button Interactive Lid Control:** Integrate break-beam pet safety into lid opening/closing logic (automatic lid open on pet approach, safety stall cutoff, re-open if pet enters while closing).
 * **RFID Transceiver:** 134.2 kHz carrier generator (PWM timer) and envelope receiver/comparator for ISO 11784/11785 FDX-B pet microchip decoding.
 * **Battery Voltage Monitor:** ADC resistor divider monitoring 4× C-cell battery health (nominal 6.0V down to 4.0V cutoff).
 

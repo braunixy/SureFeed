@@ -70,6 +70,18 @@ typedef struct {
     uint32_t stall_count;           /* Number of stall cutoffs triggered */
     uint32_t motor_stop_reason;     /* 0=released, 1=stall cutoff, 2=timeout */
 
+    /* IR Break-Beam Diagnostics */
+    uint32_t ir_rx_pc8;             /* Live state of PC8 */
+    uint16_t ir_beam1_raw_off;      /* PB0 (ADC_IN8) reading before LED1 pulse */
+    uint16_t ir_beam1_raw_on;       /* PB0 (ADC_IN8) reading during LED1 pulse */
+    int16_t  ir_beam1_delta;        /* Pulse response on Beam 1: (on - off) */
+    uint16_t ir_beam2_raw_off;      /* PB0 (ADC_IN8) reading before LED2 pulse */
+    uint16_t ir_beam2_raw_on;       /* PB0 (ADC_IN8) reading during LED2 pulse */
+    int16_t  ir_beam2_delta;        /* Pulse response on Beam 2: (on - off) */
+    uint32_t ir_blocked;            /* 1 if beam is broken, 0 if clear */
+    uint16_t pulse_curve_b1[8];     /* [0]=off, [1]=50us, [2]=100us, [3]=200us, [4]=300us, [5]=500us, [6]=800us, [7]=1200us */
+    uint16_t pulse_curve_b2[8];     /* Beam 2 timing curve */
+
     LogEvent events[LOG_SIZE];
 } DiagnosticLog;
 
@@ -82,7 +94,15 @@ volatile DiagnosticLog g_diag = {
     .stall_channel = 0,
     .stall_max_surge = 0,
     .stall_count = 0,
-    .motor_stop_reason = 0
+    .motor_stop_reason = 0,
+    .ir_rx_pc8 = 0,
+    .ir_beam1_raw_off = 0,
+    .ir_beam1_raw_on = 0,
+    .ir_beam1_delta = 0,
+    .ir_beam2_raw_off = 0,
+    .ir_beam2_raw_on = 0,
+    .ir_beam2_delta = 0,
+    .ir_blocked = 0
 };
 
 /* Live tunable stall detection:
@@ -118,6 +138,195 @@ uint16_t ADC_Read_20ms_Filter(uint32_t channel);
 uint16_t ADC_Read_Fast(uint32_t channel);
 void Log_Event(uint32_t type, uint32_t p1, uint32_t p2, uint32_t p3);
 void Motor_Set(MotorDirection dir);
+
+void delay_us(uint32_t us)
+{
+    volatile uint32_t count = us * 8;
+    while (count--) {
+        __NOP();
+    }
+}
+
+static inline uint32_t micros_hw(void)
+{
+    uint32_t ms1, val1, ms2, val2;
+    do {
+        ms1  = HAL_GetTick();
+        val1 = SysTick->VAL;
+        ms2  = HAL_GetTick();
+        val2 = SysTick->VAL;
+    } while (ms1 != ms2 || val1 < val2);
+    uint32_t load = SysTick->LOAD + 1;
+    return (ms1 * 1000U) + ((load - 1U - val1) * 1000U) / load;
+}
+
+static inline void wait_until_us(uint32_t target_us)
+{
+    while ((int32_t)(micros_hw() - target_us) < 0) {
+        __NOP();
+    }
+}
+
+volatile uint16_t g_scope_ch8[40];
+volatile uint16_t g_scope_ch9[40];
+volatile uint32_t g_scope_seq = 0;
+
+/* Wait for the start of the 10.5ms quiet half-cycle of 50Hz mains:
+ * First wait until we see at least one noisy sample (|ch9 - 2860| > 90 or |d9| > 90),
+ * then wait for 4 consecutive quiet samples spaced 500us apart (2.0ms quiet) where
+ * both Ch8 and Ch9 are stable within [2770..2950] and step-to-step change < 65.
+ */
+static void Sync_To_Quiet_HalfCycle(void)
+{
+    uint32_t t0 = micros_hw();
+    uint16_t p8 = ADC_Read_Fast(8);
+    uint16_t p9 = ADC_Read_Fast(9);
+    int seen_noise = 0;
+    int quiet_streak = 0;
+
+    for (int step = 0; step < 80; step++) { /* Max 40ms (2 full mains cycles) */
+        wait_until_us(t0 + (uint32_t)(step + 1) * 500U);
+        uint16_t c8 = ADC_Read_Fast(8);
+        uint16_t c9 = ADC_Read_Fast(9);
+        int16_t d8 = (int16_t)c8 - (int16_t)p8;
+        int16_t d9 = (int16_t)c9 - (int16_t)p9;
+        p8 = c8;
+        p9 = c9;
+
+        uint8_t is_noisy = (abs(d8) > 80 || abs(d9) > 80 ||
+                            c8 < 2740 || c8 > 2970 ||
+                            c9 < 2740 || c9 > 2970) ? 1 : 0;
+        if (is_noisy) {
+            seen_noise = 1;
+            quiet_streak = 0;
+        } else {
+            quiet_streak++;
+            /* If we saw the burst end and have 3 quiet samples (1.5ms into the 10.5ms quiet window),
+             * or if the room is completely dark (no burst at all for 12 samples), we are ready! */
+            if ((seen_noise && quiet_streak >= 3) || (!seen_noise && quiet_streak >= 12)) {
+                return;
+            }
+        }
+    }
+}
+
+static void Capture_Single_Channel_Pulse(uint32_t channel, uint16_t led_pin, volatile uint16_t *dst)
+{
+    /* Configure and lock ADC on single channel with full 160.5-cycle sampling time (~12us/sample) */
+    if ((hadc.Instance->CR & ADC_CR_ADEN) == 0) {
+        hadc.Instance->ISR = ADC_ISR_ADRDY;
+        hadc.Instance->CR |= ADC_CR_ADEN;
+        while ((hadc.Instance->ISR & ADC_ISR_ADRDY) == 0) __NOP();
+    }
+    hadc.Instance->CHSELR = (1UL << channel);
+
+    /* Warmup 2 dummy reads so S&H cap is settled on this channel */
+    for (int w = 0; w < 2; w++) {
+        hadc.Instance->ISR = ADC_ISR_EOC | ADC_ISR_EOS;
+        hadc.Instance->CR |= ADC_CR_ADSTART;
+        while ((hadc.Instance->ISR & ADC_ISR_EOC) == 0) __NOP();
+        (void)hadc.Instance->DR;
+    }
+
+    uint32_t t0 = micros_hw() + 20U;
+    for (int i = 0; i < 20; i++) {
+        wait_until_us(t0 + (uint32_t)i * 25U); /* Exact 25us sample period (40 kHz) */
+        if (i == 4) {
+            HAL_GPIO_WritePin(GPIOC, led_pin, GPIO_PIN_SET);   /* LED ON at t = 100us */
+        } else if (i == 16) {
+            HAL_GPIO_WritePin(GPIOC, led_pin, GPIO_PIN_RESET); /* LED OFF at t = 400us (300us pulse) */
+        }
+        hadc.Instance->ISR = ADC_ISR_EOC | ADC_ISR_EOS;
+        hadc.Instance->CR |= ADC_CR_ADSTART;
+        while ((hadc.Instance->ISR & ADC_ISR_EOC) == 0) __NOP();
+        dst[i] = (uint16_t)hadc.Instance->DR;
+    }
+    HAL_GPIO_WritePin(GPIOC, led_pin, GPIO_PIN_RESET);
+}
+
+static int16_t Eval_Matched_Pulse(volatile uint16_t *dst)
+{
+    int32_t v_pre = ((int32_t)dst[2] + (int32_t)dst[3]) / 2;
+    int32_t v_on  = (int32_t)dst[4];
+    int32_t v_mid = ((int32_t)dst[14] + (int32_t)dst[15]) / 2;
+    int32_t v_off = (int32_t)dst[16];
+
+    int32_t drop_on  = v_pre - v_on;  /* Positive when optical turn-on pulls PB0/PB1 low */
+    int32_t jump_off = v_off - v_mid; /* Positive when optical turn-off spikes PB0/PB1 high */
+
+    /* Both the falling turn-on edge AND rising turn-off edge must be present */
+    if (drop_on < 150 || jump_off < 100) {
+        return 0;
+    }
+
+    return (int16_t)(drop_on + jump_off);
+}
+
+static void IR_Sample_Pulsed(void)
+{
+    /* PC8 is Active-LOW: Drive LOW (0V) to enable high-side switch Q801 (powers NET 7 VCC_IR) */
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_RESET);
+    g_diag.ir_rx_pc8 = 0;
+
+    IR_LED1_OFF();
+    IR_LED2_OFF();
+
+    /* 1. Quiet Window 1: Capture Beam 1 (Left LED PC6 -> PB0 / ADC_IN8) */
+    Sync_To_Quiet_HalfCycle();
+    Capture_Single_Channel_Pulse(8, GPIO_PIN_6, &g_scope_ch8[0]);
+
+    HAL_Delay(14);
+
+    /* 2. Quiet Window 2: Capture Beam 2 (Right LED PC7 -> PB1 / ADC_IN9) */
+    Sync_To_Quiet_HalfCycle();
+    Capture_Single_Channel_Pulse(9, GPIO_PIN_7, &g_scope_ch9[20]);
+
+    g_scope_seq++;
+
+    /* Evaluate Double-Edge Matched Filter (drop_on + jump_off) */
+    int16_t b1_ch8 = Eval_Matched_Pulse(&g_scope_ch8[0]);  /* Direct Beam 1 */
+    int16_t b2_ch9 = Eval_Matched_Pulse(&g_scope_ch9[20]); /* Direct Beam 2 */
+
+    g_diag.ir_beam1_raw_off = g_scope_ch8[3];
+    g_diag.ir_beam1_raw_on  = g_scope_ch8[4];
+    g_diag.ir_beam1_delta   = b1_ch8;
+
+    g_diag.ir_beam2_raw_off = g_scope_ch9[23];
+    g_diag.ir_beam2_raw_on  = g_scope_ch9[24];
+    g_diag.ir_beam2_delta   = b2_ch9;
+
+    g_diag.pulse_curve_b1[0] = (uint16_t)b1_ch8;
+    g_diag.pulse_curve_b1[1] = g_scope_ch8[2];
+    g_diag.pulse_curve_b1[2] = g_scope_ch8[3];
+    g_diag.pulse_curve_b1[3] = g_scope_ch8[4];
+    g_diag.pulse_curve_b1[4] = g_scope_ch8[15];
+    g_diag.pulse_curve_b1[5] = g_scope_ch8[16];
+
+    g_diag.pulse_curve_b2[0] = (uint16_t)b2_ch9;
+    g_diag.pulse_curve_b2[1] = g_scope_ch9[22];
+    g_diag.pulse_curve_b2[2] = g_scope_ch9[23];
+    g_diag.pulse_curve_b2[3] = g_scope_ch9[24];
+    g_diag.pulse_curve_b2[4] = g_scope_ch9[35];
+    g_diag.pulse_curve_b2[5] = g_scope_ch9[36];
+
+    /* --- Optical Break-Beam Evaluation ---
+     * Unobstructed:
+     *   Beam 1 (PC6 -> PB0/Ch8): ~1100 to 1300 counts (drop_on ~780 + jump_off ~450)
+     *   Beam 2 (PC7 -> PB1/Ch9): ~1680 to 1780 counts (drop_on ~1130 + jump_off ~600)
+     * Obstructed:
+     *   When hand/pet blocks either beam, its matched pulse response drops below threshold.
+     */
+    static uint8_t blocked_hits = 0;
+    uint8_t sample_is_blocked = ((b1_ch8 < 650) || (b2_ch9 < 900)) ? 1 : 0;
+
+    if (sample_is_blocked) {
+        if (blocked_hits < 4) blocked_hits++;
+    } else {
+        if (blocked_hits > 0) blocked_hits--;
+    }
+
+    g_diag.ir_blocked = (blocked_hits >= 2) ? 1 : 0;
+}
 
 int main(void)
 {
@@ -198,8 +407,8 @@ int main(void)
             prev_idr_B = cur_B;
         }
 
-        /* Port C: Exclude LED (Pin 10) */
-        uint16_t diff_C = (cur_C ^ prev_idr_C) & ~(1 << 10);
+        /* Port C: Exclude LED (Pin 10), IR Emitters (Pins 6, 7), and IR RX Enable (Pin 8) */
+        uint16_t diff_C = (cur_C ^ prev_idr_C) & ~( (1 << 6) | (1 << 7) | (1 << 8) | (1 << 10) );
         if (diff_C) {
             for (int p = 0; p < 16; p++) {
                 if (diff_C & (1 << p)) {
@@ -392,32 +601,16 @@ int main(void)
                 g_diag.motor_state = MOTOR_STOP;
                 g_diag.motor_stop_reason = 0; /* 0 = Normal button release */
             }
-
-            /* Periodically refresh idle ADC readings when stopped */
-            static uint32_t last_idle_adc_time = 0;
-            if (now - last_idle_adc_time >= 100) {
-                last_idle_adc_time = now;
-                for (uint32_t ch = 0; ch < 16; ch++) {
-                    if (ch == 1) continue;
-                    g_diag.live_adc[ch] = ADC_Read_Fast(ch);
-                }
-            }
         }
 
-        /* --- IR LED Test: Alternate LED1 and LED2 every 500ms ---
-         * Pulsing one LED at a time provides 2x higher current through R820
-         * and makes the blink easily visible on camera and multimeter!
+        /* --- Dual-Channel Time-Division Multiplexed Break-Beam Detection ---
+         * Sampled every 50ms using microsecond pulses to reject 100Hz ambient light ripple.
          */
-        static uint32_t last_ir_cycle = 0;
-        if (now - last_ir_cycle >= 1000) {
-            last_ir_cycle = now;
-        }
-        if (now - last_ir_cycle < 500) {
-            IR_LED1_ON();
-            IR_LED2_OFF();
-        } else {
-            IR_LED1_OFF();
-            IR_LED2_ON();
+        static uint32_t last_ir_time = 0;
+        if (now - last_ir_time >= 50) {
+            IR_Sample_Pulsed();
+            now = HAL_GetTick();
+            last_ir_time = now;
         }
 
         /* --- 5. Status LED Indication --- */
@@ -454,8 +647,13 @@ int main(void)
                 LED_GREEN_OFF();
             }
             heartbeat_on = 0;
+        } else if (g_diag.ir_blocked) {
+            /* Beam Broken / Pet Detected in Arch: Solid RED */
+            LED_RED_ON();
+            LED_GREEN_OFF();
+            heartbeat_on = 0;
         } else {
-            /* Idle: Green Heartbeat pulse (40ms ON every 1200ms) */
+            /* Idle & Beam Clear: Green Heartbeat pulse (40ms ON every 1200ms) */
             LED_RED_OFF();
             if (now - last_heartbeat >= 1200) {
                 last_heartbeat = now;
@@ -549,11 +747,11 @@ void GPIO_Init_All(void)
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-    /* Port C Digital Inputs (skip PC6, PC7 for IR LEDs, PC10 for LED, and PC0-PC5 for analog) */
+    /* Port C Digital Inputs (skip PC6, PC7, PC8 for IR, PC10 for LED, and PC0-PC5 for analog) */
     GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
     GPIO_InitStruct.Pull = GPIO_PULLUP;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-    GPIO_InitStruct.Pin = GPIO_PIN_All & ~(GPIO_PIN_6 | GPIO_PIN_7 | GPIO_PIN_10 | 0x003F);
+    GPIO_InitStruct.Pin = GPIO_PIN_All & ~(GPIO_PIN_6 | GPIO_PIN_7 | GPIO_PIN_8 | GPIO_PIN_10 | 0x003F);
     HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
     /* Port C Analog Pins: PC0..PC5 */
@@ -602,13 +800,16 @@ void GPIO_Init_All(void)
     HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
     HAL_GPIO_WritePin(GPIOE, GPIO_PIN_11 | GPIO_PIN_12, GPIO_PIN_RESET);
 
-    /* 4. IR Emitter LEDs: PC6 (Pin 63 - IR LED 1 via Q807), PC7 (Pin 64 - IR LED 2 via Q806) */
-    GPIO_InitStruct.Pin = GPIO_PIN_6 | GPIO_PIN_7;
+    /* 4. IR Emitter LEDs: PC6 (Pin 63 - IR LED 1 via Q807), PC7 (Pin 64 - IR LED 2 via Q806)
+     *    IR Receiver Gate: PC8 (Pin 65 - Q801 Gate / Enable)
+     */
+    GPIO_InitStruct.Pin = GPIO_PIN_6 | GPIO_PIN_7 | GPIO_PIN_8;
     GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
-    IR_LEDS_ON(); /* Turn ON both IR LEDs continuously for test */
+    IR_LEDS_OFF(); /* Start with IR LEDs OFF; pulsed during sampling */
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_RESET); /* Drive PC8 LOW to enable optical receiver */
 }
 
 void ADC_Init_Multi(void)
