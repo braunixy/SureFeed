@@ -43,9 +43,17 @@ typedef enum {
     MOTOR_CLOSE = 2   /* Reverse (PE12 = HIGH) */
 } MotorDirection;
 
+typedef enum {
+    LID_CLOSED      = 0,
+    LID_OPENING     = 1,
+    LID_OPEN_AUTO   = 2,
+    LID_OPEN_MANUAL = 3,
+    LID_CLOSING     = 4
+} LidState;
+
 typedef struct {
     uint32_t timestamp_ms;
-    uint32_t type;       /* 1=Digital, 2=ADC shift, 3=Button, 4=Slider, 5=Stall Cutoff */
+    uint32_t type;       /* 1=Digital, 2=ADC shift, 3=Button, 4=Slider, 5=Stall Cutoff, 7=RFID */
     uint32_t param1;     /* Channel, ButtonId, or Port */
     uint32_t param2;     /* Surge counts, Pin, or IDR */
     uint32_t param3;     /* Runtime ms or State */
@@ -59,6 +67,15 @@ typedef struct {
     uint32_t live_idr[5];           /* [0]=Port A, [1]=Port B, etc. */
     uint32_t active_button;         /* 0=None, 1=Open/Close, 2=Add Pet, 3=Learn */
     uint32_t slider_event_pin;      /* Slider position: 1, 2, 3 */
+
+    /* Feeder & Lid State Machine */
+    uint32_t lid_state;             /* 0=Closed, 1=Opening, 2=Open Auto, 3=Open Manual, 4=Closing */
+    uint32_t target_open_mode;      /* LID_OPEN_AUTO or LID_OPEN_MANUAL */
+    uint32_t auto_mode_active;      /* 1 if automatic IR control is active, 0 if manual lock */
+    uint32_t rfid_scan_active;      /* 1 if RFID scanner is active */
+    uint32_t add_pet_mode;          /* 1 if in Add Pet mode */
+    uint32_t learn_mode;            /* 1 if in Learn mode */
+    uint32_t motor_speed_pct;       /* 100, 75, or 50 */
 
     /* Motor & Current Sensing Diagnostics */
     uint32_t motor_state;           /* 0=STOP, 1=OPEN, 2=CLOSE */
@@ -79,8 +96,8 @@ typedef struct {
     uint16_t ir_beam2_raw_on;       /* PB0 (ADC_IN8) reading during LED2 pulse */
     int16_t  ir_beam2_delta;        /* Pulse response on Beam 2: (on - off) */
     uint32_t ir_blocked;            /* 1 if beam is broken, 0 if clear */
-    uint16_t pulse_curve_b1[8];     /* [0]=off, [1]=50us, [2]=100us, [3]=200us, [4]=300us, [5]=500us, [6]=800us, [7]=1200us */
-    uint16_t pulse_curve_b2[8];     /* Beam 2 timing curve */
+    uint16_t pulse_curve_b1[8];
+    uint16_t pulse_curve_b2[8];
 
     LogEvent events[LOG_SIZE];
 } DiagnosticLog;
@@ -90,7 +107,13 @@ volatile DiagnosticLog g_diag = {
     .event_count = 0,
     .head_index = 0,
     .active_button = 0,
-    .slider_event_pin = 0,
+    .slider_event_pin = 2,
+    .lid_state = 0,
+    .auto_mode_active = 1,
+    .rfid_scan_active = 0,
+    .add_pet_mode = 0,
+    .learn_mode = 0,
+    .motor_speed_pct = 75,
     .stall_channel = 0,
     .stall_max_surge = 0,
     .stall_count = 0,
@@ -131,13 +154,30 @@ volatile uint16_t g_stall_threshold = 4096;
 
 ADC_HandleTypeDef hadc;
 
+static volatile MotorDirection s_target_motor_dir = MOTOR_STOP;
+static volatile uint32_t s_target_duty_pct = 100;
+static volatile uint32_t s_motor_pwm_counter = 0;
+
+static uint32_t motor_start_time = 0;
+static uint16_t motor_peak_pc4 = 0;
+static uint32_t stall_feedback_until = 0;
+static uint32_t pet_clear_time = 0;
+
 void SystemClock_Config(void);
 void GPIO_Init_All(void);
 void ADC_Init_Multi(void);
 uint16_t ADC_Read_20ms_Filter(uint32_t channel);
 uint16_t ADC_Read_Fast(uint32_t channel);
 void Log_Event(uint32_t type, uint32_t p1, uint32_t p2, uint32_t p3);
+void Motor_Drive(MotorDirection dir, uint32_t duty_pct);
 void Motor_Set(MotorDirection dir);
+void Lid_Start_Opening(LidState target_mode);
+void Lid_Start_Closing(void);
+void Lid_Stop_Motion(uint32_t stop_reason);
+void RFID_Scan_Start(void);
+void RFID_Scan_Stop(void);
+void RFID_Learn_Start(void);
+void RFID_Learn_Stop(void);
 
 void delay_us(uint32_t us)
 {
@@ -350,24 +390,13 @@ int main(void)
     uint16_t prev_idr_D = (uint16_t)GPIOD->IDR;
     uint16_t prev_idr_E = (uint16_t)GPIOE->IDR;
 
-    ButtonId current_btn  = BTN_NONE;
-    ButtonId reported_btn = BTN_NONE;
-
-    uint32_t last_heartbeat = 0;
-    uint8_t  heartbeat_on   = 0;
-
     /* Initialize slider position */
     uint8_t prev_slider_pos = ((GPIOB->IDR & (1 << 3)) == 0 ? 1 :
                               ((GPIOB->IDR & (1 << 4)) == 0 ? 2 :
                               ((GPIOB->IDR & (1 << 5)) == 0 ? 3 : 2)));
     uint8_t slider_feedback_pos = 0;
     uint32_t slider_feedback_until = 0;
-
-    /* Motor state tracking */
-    uint32_t motor_start_time = 0;
-    uint8_t  stall_latched = 0;
-    uint32_t stall_feedback_until = 0;
-    uint16_t motor_peak_pc4 = 0;
+    uint32_t close_delay_ms = 2500;
 
     while (1)
     {
@@ -439,19 +468,17 @@ int main(void)
             prev_idr_E = cur_E;
         }
 
-        /* --- 2. Button Line Sampling ---
-         * When motor is STOPPED, use 20ms mains-hum integration filter.
-         * When motor is RUNNING, use high-speed single conversion for fast control loop.
+        /* --- 2. Button Line Sampling & Debouncing ---
+         * When lid is moving, use fast single conversion. When stopped, use 20ms integration.
          */
         uint16_t raw_1;
-        if (g_diag.motor_state == MOTOR_STOP) {
-            raw_1 = ADC_Read_20ms_Filter(ADC_CHANNEL_1);
-        } else {
+        if (g_diag.lid_state == LID_OPENING || g_diag.lid_state == LID_CLOSING) {
             raw_1 = ADC_Read_Fast(ADC_CHANNEL_1);
+        } else {
+            raw_1 = ADC_Read_20ms_Filter(ADC_CHANNEL_1);
         }
         g_diag.live_adc[1] = raw_1;
 
-        /* Decode Active Button */
         ButtonId candidate_btn = BTN_NONE;
         if (raw_1 > 1800) {
             candidate_btn = BTN_OPEN_CLOSE; /* SW2: ~2050 counts */
@@ -463,19 +490,67 @@ int main(void)
             candidate_btn = BTN_NONE;
         }
 
-        current_btn = candidate_btn;
-        g_diag.active_button = current_btn;
+        /* 30ms stable debounce with rising-edge detection */
+        static ButtonId debounced_btn = BTN_NONE;
+        static ButtonId last_raw_btn  = BTN_NONE;
+        static uint32_t btn_change_time = 0;
+        ButtonId btn_pressed_event = BTN_NONE;
 
-        if (current_btn != reported_btn) {
-            Log_Event(3, current_btn, raw_1, 0);
-            reported_btn = current_btn;
-            /* If user releases button, clear the stall lockout latch */
-            if (current_btn == BTN_NONE) {
-                stall_latched = 0;
+        if (candidate_btn != last_raw_btn) {
+            last_raw_btn = candidate_btn;
+            btn_change_time = now;
+        } else if ((now - btn_change_time) >= 30) {
+            if (candidate_btn != debounced_btn) {
+                if (candidate_btn != BTN_NONE && debounced_btn == BTN_NONE) {
+                    btn_pressed_event = candidate_btn; /* Fresh rising edge! */
+                }
+                debounced_btn = candidate_btn;
+                g_diag.active_button = debounced_btn;
+                Log_Event(3, debounced_btn, raw_1, 0);
             }
         }
 
-        /* --- 3. Decode 3-Position Slider Switch --- */
+        /* --- 3. Button Action Handling --- */
+        if (btn_pressed_event == BTN_OPEN_CLOSE) {
+            if (g_diag.lid_state == LID_CLOSED) {
+                /* User manually opened lid: hold open and DEACTIVATE automatic mode */
+                g_diag.auto_mode_active = 0;
+                Lid_Start_Opening(LID_OPEN_MANUAL);
+            } else if (g_diag.lid_state == LID_OPEN_MANUAL || g_diag.lid_state == LID_OPEN_AUTO) {
+                /* User pressed while open: close lid and RE-ACTIVATE automatic mode */
+                g_diag.auto_mode_active = 1;
+                Lid_Start_Closing();
+            } else if (g_diag.lid_state == LID_OPENING) {
+                /* Cancel opening: switch to closing */
+                g_diag.auto_mode_active = 1;
+                Lid_Start_Closing();
+            } else if (g_diag.lid_state == LID_CLOSING) {
+                /* Safety manual interrupt: re-open */
+                g_diag.auto_mode_active = 0;
+                Lid_Start_Opening(LID_OPEN_MANUAL);
+            }
+        } else if (btn_pressed_event == BTN_ADD_PET) {
+            /* Toggle Add Pet mode: activates RFID learn stub */
+            g_diag.add_pet_mode = !g_diag.add_pet_mode;
+            if (g_diag.add_pet_mode) {
+                RFID_Learn_Start();
+                if (g_diag.lid_state == LID_CLOSED) {
+                    g_diag.auto_mode_active = 0;
+                    Lid_Start_Opening(LID_OPEN_MANUAL);
+                }
+            } else {
+                RFID_Learn_Stop();
+            }
+        } else if (btn_pressed_event == BTN_LEARN) {
+            /* Toggle Learn / Training mode */
+            g_diag.learn_mode = !g_diag.learn_mode;
+            Log_Event(3, BTN_LEARN, g_diag.learn_mode, 0);
+        }
+
+        /* --- 4. Decode 3-Position Slider Switch ---
+         * Controls motor PWM speed (Pos 1: 100%, Pos 2: 75%, Pos 3: 50%)
+         * and auto-close delay (Pos 1: 1.5s, Pos 2: 2.5s, Pos 3: 4.0s)
+         */
         uint8_t pb3 = (cur_B >> 3) & 1;
         uint8_t pb4 = (cur_B >> 4) & 1;
         uint8_t pb5 = (cur_B >> 5) & 1;
@@ -490,122 +565,25 @@ int main(void)
         }
         g_diag.slider_event_pin = (uint32_t)slider_pos;
 
+        if (slider_pos == 1) {
+            g_diag.motor_speed_pct = 100;
+            close_delay_ms = 1500;
+        } else if (slider_pos == 2) {
+            g_diag.motor_speed_pct = 75;
+            close_delay_ms = 2500;
+        } else {
+            g_diag.motor_speed_pct = 50;
+            close_delay_ms = 4000;
+        }
+
         if (slider_pos != prev_slider_pos) {
-            Log_Event(4, slider_pos, (cur_B & 0x38), 0);
+            Log_Event(4, slider_pos, (cur_B & 0x38), g_diag.motor_speed_pct);
             slider_feedback_pos = slider_pos;
             slider_feedback_until = now + 600;
             prev_slider_pos = slider_pos;
         }
 
-        /* --- 4. Motor Drive & Real-Time Stall Current Detection ---
-         * Learn Mode (SW3) -> Drives Motor OPEN (PE11 = HIGH)
-         * Add Pet    (SW1) -> Drives Motor CLOSE (PE12 = HIGH)
-         * Automatic Stall Cutoff: Stops motor if current surge exceeds threshold.
-         */
-        MotorDirection requested_dir = MOTOR_STOP;
-        if (!stall_latched) {
-            if (current_btn == BTN_LEARN) {
-                requested_dir = MOTOR_OPEN;
-            } else if (current_btn == BTN_ADD_PET) {
-                requested_dir = MOTOR_CLOSE;
-            }
-        }
-
-        if (requested_dir != MOTOR_STOP) {
-            if (g_diag.motor_state == MOTOR_STOP) {
-                /* Starting motor: sample idle baseline across all 16 channels */
-                for (uint32_t ch = 0; ch < 16; ch++) {
-                    if (ch == 1) continue;
-                    uint16_t v = ADC_Read_Fast(ch);
-                    g_diag.live_adc[ch] = v;
-                    g_diag.motor_idle_adc[ch] = v;
-                    g_diag.motor_peak_adc[ch] = v;
-                    g_diag.motor_diff_adc[ch] = 0;
-                }
-                g_diag.stall_channel = 0;
-                g_diag.stall_max_surge = 0;
-                motor_peak_pc4 = 0;
-                motor_start_time = now;
-                Motor_Set(requested_dir);
-                g_diag.motor_state = requested_dir;
-            }
-
-            uint32_t run_duration = now - motor_start_time;
-
-            /* Safety 4.0s timeout to protect motor */
-            if (run_duration >= 4000) {
-                Motor_Set(MOTOR_STOP);
-                g_diag.motor_state = MOTOR_STOP;
-                g_diag.motor_stop_reason = 2; /* 2 = Timeout */
-                stall_latched = 1;
-            } else {
-                /* Fast multi-channel ADC scan during motor run */
-                for (uint32_t ch = 0; ch < 16; ch++) {
-                    if (ch == 1) continue; /* Skip button line */
-                    uint16_t v = ADC_Read_Fast(ch);
-                    g_diag.live_adc[ch] = v;
-
-                    if (v > g_diag.motor_peak_adc[ch]) {
-                        g_diag.motor_peak_adc[ch] = v;
-                    }
-
-                    int16_t diff = (int16_t)v - (int16_t)g_diag.motor_idle_adc[ch];
-                    if (diff > g_diag.motor_diff_adc[ch]) {
-                        g_diag.motor_diff_adc[ch] = diff;
-                    }
-
-                    /* Only evaluate stall surges AFTER the 200ms inrush blanking period */
-                    if (run_duration > 200) {
-                        if (diff > g_diag.stall_max_surge) {
-                            g_diag.stall_max_surge = diff;
-                            g_diag.stall_channel = ch;
-                        }
-                    }
-                }
-
-                /* Periodic diagnostic logging every 100ms during run:
-                 * param1 = run_duration_ms, param2 = Ch14 (PC4), param3 = Ch15 (PC5) */
-                static uint32_t last_run_log_time = 0;
-                if (now - last_run_log_time >= 100) {
-                    last_run_log_time = now;
-                    Log_Event(6, run_duration, g_diag.live_adc[14], g_diag.live_adc[15]);
-                }
-
-                /* Stall Cutoff: Detect supply rail sag on PC4 (Channel 14)
-                 * While moving freely: PC4 = 3550 ± 20
-                 * When hitting mechanical stop: PC4 plunges to 3385 (sag of ~175 counts)
-                 */
-                uint16_t pc4 = g_diag.live_adc[14];
-                if (run_duration > 200) {
-                    if (pc4 > motor_peak_pc4) {
-                        motor_peak_pc4 = pc4;
-                    }
-
-                    if ((motor_peak_pc4 >= 3450) && ((motor_peak_pc4 - pc4) >= g_stall_sag_threshold)) {
-                        /* Stall detected! Cut motor power immediately */
-                        Motor_Set(MOTOR_STOP);
-                        g_diag.motor_state = MOTOR_STOP;
-                        g_diag.motor_stop_reason = 1; /* 1 = Stall cutoff */
-                        g_diag.stall_count++;
-                        stall_latched = 1;
-                        stall_feedback_until = now + 500; /* Solid orange visual feedback */
-
-                        Log_Event(5, 14, (uint32_t)(motor_peak_pc4 - pc4), run_duration);
-                    }
-                }
-            }
-        } else {
-            /* Motor requested STOP */
-            if (g_diag.motor_state != MOTOR_STOP) {
-                Motor_Set(MOTOR_STOP);
-                g_diag.motor_state = MOTOR_STOP;
-                g_diag.motor_stop_reason = 0; /* 0 = Normal button release */
-            }
-        }
-
-        /* --- Dual-Channel Time-Division Multiplexed Break-Beam Detection ---
-         * Sampled every 50ms using microsecond pulses to reject 100Hz ambient light ripple.
-         */
+        /* --- 5. Dual-Channel Time-Division Multiplexed Break-Beam Detection --- */
         static uint32_t last_ir_time = 0;
         if (now - last_ir_time >= 50) {
             IR_Sample_Pulsed();
@@ -613,27 +591,93 @@ int main(void)
             last_ir_time = now;
         }
 
-        /* --- 5. Status LED Indication --- */
+        /* --- 6. Automatic Pet Sensing & Lid Controller --- */
+        if (g_diag.auto_mode_active) {
+            if (g_diag.lid_state == LID_CLOSED) {
+                if (g_diag.ir_blocked) {
+                    /* Pet approached archway: activate RFID scan and drive lid open */
+                    RFID_Scan_Start();
+                    g_diag.rfid_scan_active = 1;
+                    Lid_Start_Opening(LID_OPEN_AUTO);
+                }
+            } else if (g_diag.lid_state == LID_OPEN_AUTO) {
+                if (g_diag.ir_blocked) {
+                    /* Pet remains eating in bowl: keep reset timer */
+                    pet_clear_time = now;
+                } else {
+                    /* Pet has left archway: close after slider grace delay */
+                    if ((now - pet_clear_time) >= close_delay_ms) {
+                        RFID_Scan_Stop();
+                        g_diag.rfid_scan_active = 0;
+                        Lid_Start_Closing();
+                    }
+                }
+            } else if (g_diag.lid_state == LID_CLOSING) {
+                if (g_diag.ir_blocked) {
+                    /* SAFETY REVERSE: Pet re-entered archway during closing! */
+                    RFID_Scan_Start();
+                    g_diag.rfid_scan_active = 1;
+                    Lid_Start_Opening(LID_OPEN_AUTO);
+                }
+            }
+        }
+
+        /* --- 7. Motor Motion Supervision & Real-Time Stall Cutoff --- */
+        if (g_diag.lid_state == LID_OPENING || g_diag.lid_state == LID_CLOSING) {
+            uint32_t run_duration = now - motor_start_time;
+            uint16_t pc4 = ADC_Read_Fast(14);
+            g_diag.live_adc[14] = pc4;
+
+            /* Periodic diagnostic logging every 100ms during run */
+            static uint32_t last_run_log_time = 0;
+            if (now - last_run_log_time >= 100) {
+                last_run_log_time = now;
+                Log_Event(6, run_duration, pc4, g_diag.lid_state);
+            }
+
+            /* Safety 4.0s timeout to protect motor */
+            if (run_duration >= 4000) {
+                Lid_Stop_Motion(2); /* 2 = Timeout */
+                if (g_diag.lid_state == LID_OPENING) {
+                    g_diag.lid_state = g_diag.target_open_mode;
+                    if (g_diag.lid_state == LID_OPEN_AUTO) pet_clear_time = now;
+                } else {
+                    g_diag.lid_state = LID_CLOSED;
+                    if (g_diag.rfid_scan_active) {
+                        RFID_Scan_Stop();
+                        g_diag.rfid_scan_active = 0;
+                    }
+                }
+            } else if (run_duration > 200) {
+                /* After 200ms inrush blanking, monitor PC4 rail sag */
+                if (pc4 > motor_peak_pc4) {
+                    motor_peak_pc4 = pc4;
+                }
+
+                if ((motor_peak_pc4 >= 3450) && ((motor_peak_pc4 - pc4) >= g_stall_sag_threshold)) {
+                    /* Mechanical end-stop reached! Cut motor immediately */
+                    Log_Event(5, 14, (uint32_t)(motor_peak_pc4 - pc4), run_duration);
+                    Lid_Stop_Motion(1); /* 1 = Stall cutoff */
+
+                    if (g_diag.lid_state == LID_OPENING) {
+                        g_diag.lid_state = g_diag.target_open_mode;
+                        if (g_diag.lid_state == LID_OPEN_AUTO) pet_clear_time = now;
+                    } else {
+                        g_diag.lid_state = LID_CLOSED;
+                        if (g_diag.rfid_scan_active) {
+                            RFID_Scan_Stop();
+                            g_diag.rfid_scan_active = 0;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* --- 8. Status LED Indication --- */
         if (now < stall_feedback_until) {
             /* Stall Cutoff Feedback: Solid ORANGE / AMBER */
             LED_RED_ON();
             LED_GREEN_ON();
-            heartbeat_on = 0;
-        } else if (current_btn == BTN_OPEN_CLOSE) {
-            /* Open / Close -> Solid RED */
-            LED_RED_ON();
-            LED_GREEN_OFF();
-            heartbeat_on = 0;
-        } else if (current_btn == BTN_ADD_PET) {
-            /* Add Pet -> Solid ORANGE */
-            LED_RED_ON();
-            LED_GREEN_ON();
-            heartbeat_on = 0;
-        } else if (current_btn == BTN_LEARN) {
-            /* Learn Mode -> Solid GREEN */
-            LED_RED_OFF();
-            LED_GREEN_ON();
-            heartbeat_on = 0;
         } else if (now < slider_feedback_until) {
             /* Slider switch feedback */
             if (slider_feedback_pos == 1) {
@@ -646,25 +690,34 @@ int main(void)
                 LED_RED_ON();
                 LED_GREEN_OFF();
             }
-            heartbeat_on = 0;
-        } else if (g_diag.ir_blocked) {
-            /* Beam Broken / Pet Detected in Arch: Solid RED */
+        } else if (g_diag.lid_state == LID_OPENING || g_diag.lid_state == LID_CLOSING) {
+            /* Lid in motion: Solid AMBER */
+            LED_RED_ON();
+            LED_GREEN_ON();
+        } else if (g_diag.lid_state == LID_OPEN_MANUAL) {
+            /* Manual Hold Open: Solid RED (automatic mode paused) */
             LED_RED_ON();
             LED_GREEN_OFF();
-            heartbeat_on = 0;
-        } else {
-            /* Idle & Beam Clear: Green Heartbeat pulse (40ms ON every 1200ms) */
-            LED_RED_OFF();
-            if (now - last_heartbeat >= 1200) {
-                last_heartbeat = now;
-                heartbeat_on = 1;
+        } else if (g_diag.add_pet_mode) {
+            /* Add Pet Mode: Solid AMBER */
+            LED_RED_ON();
+            LED_GREEN_ON();
+        } else if (g_diag.learn_mode) {
+            /* Learn Mode: Flashing GREEN */
+            if ((now / 250) % 2) {
                 LED_GREEN_ON();
-            } else if (heartbeat_on && (now - last_heartbeat >= 40)) {
-                heartbeat_on = 0;
-                LED_GREEN_OFF();
-            } else if (!heartbeat_on) {
+            } else {
                 LED_GREEN_OFF();
             }
+            LED_RED_OFF();
+        } else if (g_diag.ir_blocked) {
+            /* Beam Broken / Pet in Archway: Solid RED */
+            LED_RED_ON();
+            LED_GREEN_OFF();
+        } else {
+            /* Normal Automatic Mode (Idle Closed or Auto Open): Green PERMANENTLY ON */
+            LED_RED_OFF();
+            LED_GREEN_ON();
         }
     }
 }
@@ -682,31 +735,80 @@ void Log_Event(uint32_t type, uint32_t p1, uint32_t p2, uint32_t p3)
     g_diag.event_count++;
 }
 
-static MotorDirection s_current_motor_dir = MOTOR_STOP;
-
-void Motor_Set(MotorDirection dir)
+void Motor_Drive(MotorDirection dir, uint32_t duty_pct)
 {
-    if (dir == s_current_motor_dir) {
+    if (dir == MOTOR_STOP) {
+        s_target_motor_dir = MOTOR_STOP;
+        GPIOE->BSRR = ((uint32_t)GPIO_PIN_11 << 16U) | ((uint32_t)GPIO_PIN_12 << 16U);
         return;
     }
 
-    if (dir == MOTOR_OPEN) {
-        /* Open: Ensure Close (PE12) is OFF first with dead-time before PE11 HIGH */
-        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_11 | GPIO_PIN_12, GPIO_PIN_RESET);
+    if (dir != s_target_motor_dir) {
+        s_target_motor_dir = MOTOR_STOP;
+        GPIOE->BSRR = ((uint32_t)GPIO_PIN_11 << 16U) | ((uint32_t)GPIO_PIN_12 << 16U);
         for (volatile int i = 0; i < 500; i++) __NOP(); /* Shoot-through dead-time */
-        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_11, GPIO_PIN_SET);
-        s_current_motor_dir = MOTOR_OPEN;
-    } else if (dir == MOTOR_CLOSE) {
-        /* Close: Ensure Open (PE11) is OFF first with dead-time before PE12 HIGH */
-        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_11 | GPIO_PIN_12, GPIO_PIN_RESET);
-        for (volatile int i = 0; i < 500; i++) __NOP(); /* Shoot-through dead-time */
-        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_12, GPIO_PIN_SET);
-        s_current_motor_dir = MOTOR_CLOSE;
-    } else {
-        /* Immediate STOP: Both pins LOW */
-        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_11 | GPIO_PIN_12, GPIO_PIN_RESET);
-        s_current_motor_dir = MOTOR_STOP;
     }
+
+    s_target_duty_pct = duty_pct;
+    s_target_motor_dir = dir;
+}
+
+void Motor_Set(MotorDirection dir)
+{
+    Motor_Drive(dir, 100);
+}
+
+void Lid_Start_Opening(LidState target_mode)
+{
+    g_diag.target_open_mode = target_mode;
+    g_diag.lid_state = LID_OPENING;
+    motor_start_time = HAL_GetTick();
+    motor_peak_pc4 = 0;
+    Motor_Drive(MOTOR_OPEN, g_diag.motor_speed_pct);
+    g_diag.motor_state = MOTOR_OPEN;
+    Log_Event(6, 1, target_mode, g_diag.motor_speed_pct);
+}
+
+void Lid_Start_Closing(void)
+{
+    g_diag.lid_state = LID_CLOSING;
+    motor_start_time = HAL_GetTick();
+    motor_peak_pc4 = 0;
+    Motor_Drive(MOTOR_CLOSE, g_diag.motor_speed_pct);
+    g_diag.motor_state = MOTOR_CLOSE;
+    Log_Event(6, 2, 0, g_diag.motor_speed_pct);
+}
+
+void Lid_Stop_Motion(uint32_t stop_reason)
+{
+    Motor_Drive(MOTOR_STOP, 0);
+    g_diag.motor_state = MOTOR_STOP;
+    g_diag.motor_stop_reason = stop_reason;
+    if (stop_reason == 1) { /* Stall cutoff */
+        g_diag.stall_count++;
+        stall_feedback_until = HAL_GetTick() + 500;
+    }
+}
+
+/* RFID Subsystem Stubs (Antenna & 134.2 kHz carrier decoding in progress) */
+void RFID_Scan_Start(void)
+{
+    Log_Event(7, 1, 0, 0); /* 7=RFID, 1=Scan Start */
+}
+
+void RFID_Scan_Stop(void)
+{
+    Log_Event(7, 0, 0, 0); /* 7=RFID, 0=Scan Stop */
+}
+
+void RFID_Learn_Start(void)
+{
+    Log_Event(7, 2, 0, 0); /* 7=RFID, 2=Learn Mode Start */
+}
+
+void RFID_Learn_Stop(void)
+{
+    Log_Event(7, 3, 0, 0); /* 7=RFID, 3=Learn Mode Stop */
 }
 
 void GPIO_Init_All(void)
@@ -914,4 +1016,36 @@ void SystemClock_Config(void)
 void SysTick_Handler(void)
 {
     HAL_IncTick();
+
+    s_motor_pwm_counter++;
+    uint32_t step = s_motor_pwm_counter % 4; /* 250 Hz cycle (4 x 1ms) */
+
+    if (s_target_motor_dir == MOTOR_STOP) {
+        GPIOE->BSRR = ((uint32_t)GPIO_PIN_11 << 16U) | ((uint32_t)GPIO_PIN_12 << 16U);
+        return;
+    }
+
+    if (s_target_duty_pct >= 100) {
+        if (s_target_motor_dir == MOTOR_OPEN) {
+            GPIOE->BSRR = ((uint32_t)GPIO_PIN_12 << 16U) | GPIO_PIN_11;
+        } else if (s_target_motor_dir == MOTOR_CLOSE) {
+            GPIOE->BSRR = ((uint32_t)GPIO_PIN_11 << 16U) | GPIO_PIN_12;
+        }
+        return;
+    }
+
+    /* 75% duty: 3 ms ON, 1 ms OFF */
+    /* 50% duty: 2 ms ON, 2 ms OFF */
+    uint32_t on_steps = (s_target_duty_pct >= 70) ? 3 : 2;
+
+    if (step < on_steps) {
+        if (s_target_motor_dir == MOTOR_OPEN) {
+            GPIOE->BSRR = ((uint32_t)GPIO_PIN_12 << 16U) | GPIO_PIN_11;
+        } else if (s_target_motor_dir == MOTOR_CLOSE) {
+            GPIOE->BSRR = ((uint32_t)GPIO_PIN_11 << 16U) | GPIO_PIN_12;
+        }
+    } else {
+        /* Freewheel phase: both gates LOW */
+        GPIOE->BSRR = ((uint32_t)GPIO_PIN_11 << 16U) | ((uint32_t)GPIO_PIN_12 << 16U);
+    }
 }
