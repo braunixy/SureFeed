@@ -161,7 +161,6 @@ static volatile uint32_t s_motor_pwm_counter = 0;
 static uint32_t motor_start_time = 0;
 static uint16_t motor_peak_pc4 = 0;
 static uint32_t stall_feedback_until = 0;
-static uint32_t pet_clear_time = 0;
 static uint32_t last_run_log_time = 0;
 
 void SystemClock_Config(void);
@@ -397,7 +396,6 @@ int main(void)
                               ((GPIOB->IDR & (1 << 5)) == 0 ? 3 : 2)));
     uint8_t slider_feedback_pos = 0;
     uint32_t slider_feedback_until = 0;
-    uint32_t close_delay_ms = 2500;
 
     while (1)
     {
@@ -549,8 +547,7 @@ int main(void)
         }
 
         /* --- 4. Decode 3-Position Slider Switch ---
-         * Controls motor PWM speed (Pos 1: 100%, Pos 2: 75%, Pos 3: 50%)
-         * and auto-close delay (Pos 1: 1.5s, Pos 2: 2.5s, Pos 3: 4.0s)
+         * Controls motor PWM speed (Pos 1: 100%, Pos 2: 75%, Pos 3: 50%).
          */
         uint8_t pb3 = (cur_B >> 3) & 1;
         uint8_t pb4 = (cur_B >> 4) & 1;
@@ -568,13 +565,10 @@ int main(void)
 
         if (slider_pos == 1) {
             g_diag.motor_speed_pct = 100;
-            close_delay_ms = 1500;
         } else if (slider_pos == 2) {
             g_diag.motor_speed_pct = 75;
-            close_delay_ms = 2500;
         } else {
             g_diag.motor_speed_pct = 50;
-            close_delay_ms = 4000;
         }
 
         if (slider_pos != prev_slider_pos) {
@@ -594,34 +588,16 @@ int main(void)
             last_ir_time = now;
         }
 
-        /* --- 6. Automatic Pet Sensing & Lid Controller --- */
-        if (g_diag.auto_mode_active) {
-            if (g_diag.lid_state == LID_CLOSED) {
-                if (g_diag.ir_blocked) {
-                    /* Pet approached archway: activate RFID scan and drive lid open */
-                    RFID_Scan_Start();
-                    g_diag.rfid_scan_active = 1;
-                    Lid_Start_Opening(LID_OPEN_AUTO);
-                }
-            } else if (g_diag.lid_state == LID_OPEN_AUTO) {
-                if (g_diag.ir_blocked) {
-                    /* Pet remains eating in bowl: keep reset timer */
-                    pet_clear_time = now;
-                } else {
-                    /* Pet has left archway: close after slider grace delay */
-                    if ((now - pet_clear_time) >= close_delay_ms) {
-                        RFID_Scan_Stop();
-                        g_diag.rfid_scan_active = 0;
-                        Lid_Start_Closing();
-                    }
-                }
-            } else if (g_diag.lid_state == LID_CLOSING) {
-                if (g_diag.ir_blocked) {
-                    /* SAFETY REVERSE: Pet re-entered archway during closing! */
-                    RFID_Scan_Start();
-                    g_diag.rfid_scan_active = 1;
-                    Lid_Start_Opening(LID_OPEN_AUTO);
-                }
+        /* --- 6. IR Gate -> RFID Antenna Activation Only (Unhooked from Lid Open/Close) --- */
+        if (g_diag.ir_blocked) {
+            if (!g_diag.rfid_scan_active) {
+                RFID_Scan_Start();
+                g_diag.rfid_scan_active = 1;
+            }
+        } else {
+            if (g_diag.rfid_scan_active) {
+                RFID_Scan_Stop();
+                g_diag.rfid_scan_active = 0;
             }
         }
 
@@ -643,13 +619,8 @@ int main(void)
                 Lid_Stop_Motion(2); /* 2 = Timeout */
                 if (g_diag.lid_state == LID_OPENING) {
                     g_diag.lid_state = g_diag.target_open_mode;
-                    if (g_diag.lid_state == LID_OPEN_AUTO) pet_clear_time = now;
                 } else {
                     g_diag.lid_state = LID_CLOSED;
-                    if (g_diag.rfid_scan_active) {
-                        RFID_Scan_Stop();
-                        g_diag.rfid_scan_active = 0;
-                    }
                 }
             } else if (run_duration > 200) {
                 /* After 200ms inrush blanking, monitor PC4 rail sag */
@@ -664,13 +635,8 @@ int main(void)
 
                     if (g_diag.lid_state == LID_OPENING) {
                         g_diag.lid_state = g_diag.target_open_mode;
-                        if (g_diag.lid_state == LID_OPEN_AUTO) pet_clear_time = now;
                     } else {
                         g_diag.lid_state = LID_CLOSED;
-                        if (g_diag.rfid_scan_active) {
-                            RFID_Scan_Stop();
-                            g_diag.rfid_scan_active = 0;
-                        }
                     }
                 }
             }
