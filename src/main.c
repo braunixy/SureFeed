@@ -384,6 +384,9 @@ typedef struct {
     uint32_t last_authorized;                /* 1 if last_seen_id matched a learned pet */
     uint32_t auth_open_count;                /* Number of times lid opened for a learned pet */
     uint32_t learn_event_count;              /* Number of chips learned in this session */
+    uint32_t training_stage;                 /* 0=Normal, 1..4=Official Training Stages 1..4 */
+    uint32_t close_delay_ms;                 /* Slider close delay: I=3500ms, II=6000ms, III=10000ms */
+    uint32_t factory_reset_count;            /* Number of factory resets executed */
     uint32_t ir_online;                      /* 1 once unobstructed IR beam is detected */
     uint32_t clear_req;                      /* Set to 1 in GDB to wipe learned pets */
 } PetRegistry;
@@ -684,12 +687,17 @@ int main(void)
     Pets_Load_From_EEPROM();
     RFID_Power_Down();
 
-    uint32_t add_pet_deadline = 0U;
     uint32_t learn_baseline_crc_ok = 0U;
     uint32_t learn_success_until = 0U;
     uint32_t unauth_feedback_until = 0U;
+    uint32_t factory_reset_led_until = 0U;
+    uint32_t add_pet_hold_start = 0U;
+    uint8_t  factory_reset_fired = 0U;
+    uint8_t  factory_reset_cycle_pending = 0U;
+    uint32_t motor_partial_close_ms = 0U;
     uint32_t ir_rfid_active_until = 0U;
     uint32_t ir_last_blocked_time = 0U;
+    g_pets.close_delay_ms = 6000U;
 
     uint16_t prev_idr_A = (uint16_t)GPIOA->IDR;
     uint16_t prev_idr_B = (uint16_t)GPIOB->IDR;
@@ -833,26 +841,87 @@ int main(void)
                 g_diag.auto_mode_active = 0;
                 Lid_Start_Opening(LID_OPEN_MANUAL);
             }
-        } else if (btn_pressed_event == BTN_ADD_PET || btn_pressed_event == BTN_LEARN) {
-            /* Toggle Add Pet / Learn Microchip Mode (60s window) */
+        } else if (btn_pressed_event == BTN_ADD_PET) {
+            add_pet_hold_start = now;
+            factory_reset_fired = 0U;
+            /* Official Add Pet Mode: open lid automatically & flash green until chip is read or cancelled */
             if (!g_diag.add_pet_mode) {
                 g_diag.add_pet_mode = 1U;
-                g_diag.learn_mode = 1U;
-                add_pet_deadline = now + 60000U;
                 learn_baseline_crc_ok = g_fdxb.crc_ok_count;
                 RFID_Learn_Start();
+                if (g_diag.lid_state == LID_CLOSED || g_diag.lid_state == LID_CLOSING) {
+                    motor_partial_close_ms = 0U;
+                    Lid_Start_Opening(LID_OPEN_AUTO);
+                }
             } else {
                 g_diag.add_pet_mode = 0U;
-                g_diag.learn_mode = 0U;
                 RFID_Learn_Stop();
                 RFID_Power_Down();
+                if (g_diag.lid_state == LID_OPEN_AUTO || g_diag.lid_state == LID_OPENING) {
+                    motor_partial_close_ms = (g_pets.training_stage == 2U) ? 250U :
+                                             (g_pets.training_stage == 3U) ? 450U :
+                                             (g_pets.training_stage == 4U) ? 650U : 0U;
+                    if (g_pets.training_stage != 1U) {
+                        Lid_Start_Closing();
+                    }
+                }
             }
-            Log_Event(3, btn_pressed_event, g_diag.add_pet_mode, g_pets.count);
+            Log_Event(3, BTN_ADD_PET, g_diag.add_pet_mode, g_pets.count);
+        } else if (btn_pressed_event == BTN_LEARN) {
+            /* Official 4-Stage Training Mode (0 -> 1 -> 2 -> 3 -> 4 -> 0) */
+            uint32_t next_stage = (g_pets.training_stage + 1U) % 5U;
+            g_pets.training_stage = next_stage;
+            g_diag.learn_mode = next_stage;
+            Log_Event(3, BTN_LEARN, next_stage, 0);
+
+            if (next_stage == 1U) {
+                /* Stage 1: Lid stays 100% open continuously */
+                motor_partial_close_ms = 0U;
+                if (g_diag.lid_state != LID_OPEN_AUTO && g_diag.lid_state != LID_OPENING) {
+                    Lid_Start_Opening(LID_OPEN_AUTO);
+                }
+            } else if (next_stage >= 2U && next_stage <= 4U) {
+                /* Stages 2..4: step lid down to partial parked position (250ms / 450ms / 650ms from full open) */
+                if (g_diag.lid_state == LID_OPEN_AUTO) {
+                    motor_partial_close_ms = (next_stage == 2U) ? 250U :
+                                             (next_stage == 3U) ? 450U : 650U;
+                    Lid_Start_Closing();
+                } else if (g_diag.lid_state == LID_CLOSED) {
+                    motor_partial_close_ms = 200U;
+                    Lid_Start_Closing();
+                }
+            } else {
+                /* Stage 0: Exit Training Mode -> close lid completely */
+                motor_partial_close_ms = 0U;
+                Lid_Start_Closing();
+            }
+        }
+
+        /* 10-Second Continuous Hold on Add Pet Button -> Official Factory Reset */
+        if (debounced_btn == BTN_ADD_PET && !factory_reset_fired && (now - add_pet_hold_start) >= 10000U) {
+            factory_reset_fired = 1U;
+            g_pets.clear_req = 1U;
+            g_diag.add_pet_mode = 0U;
+            g_diag.learn_mode = 0U;
+            g_pets.training_stage = 0U;
+            RFID_Learn_Stop();
+            RFID_Power_Down();
+            factory_reset_led_until = now + 3000U;
+            factory_reset_cycle_pending = 1U;
+            motor_partial_close_ms = 0U;
+            if (g_diag.lid_state == LID_OPEN_AUTO || g_diag.lid_state == LID_OPEN_MANUAL) {
+                factory_reset_cycle_pending = 0U;
+                Lid_Start_Closing();
+            } else {
+                Lid_Start_Opening(LID_OPEN_AUTO);
+            }
+            Log_Event(7, 99, 0, 0);
         }
 
         if (g_pets.clear_req) {
             g_pets.clear_req = 0U;
             g_pets.count = 0U;
+            g_pets.factory_reset_count++;
             for (uint32_t i = 0U; i < MAX_LEARNED_PETS; i++) {
                 g_pets.ids[i] = 0ULL;
                 g_pets.iso_strs[i][0] = '\0';
@@ -860,9 +929,7 @@ int main(void)
             Pets_Save_To_EEPROM();
         }
 
-        /* --- 4. Decode 3-Position Slider Switch ---
-         * Controls motor PWM speed (Pos 1: 100%, Pos 2: 75%, Pos 3: 50%).
-         */
+        /* --- 4. Decode 3-Position Lid Close Delay Slider (I = 3.5s, II = 6.0s, III = 10.0s) --- */
         uint8_t pb3 = (cur_B >> 3) & 1;
         uint8_t pb4 = (cur_B >> 4) & 1;
         uint8_t pb5 = (cur_B >> 5) & 1;
@@ -878,15 +945,15 @@ int main(void)
         g_diag.slider_event_pin = (uint32_t)slider_pos;
 
         if (slider_pos == 1) {
-            g_diag.motor_speed_pct = 100;
+            g_pets.close_delay_ms = 3500U;
         } else if (slider_pos == 2) {
-            g_diag.motor_speed_pct = 75;
+            g_pets.close_delay_ms = 6000U;
         } else {
-            g_diag.motor_speed_pct = 50;
+            g_pets.close_delay_ms = 10000U;
         }
 
         if (slider_pos != prev_slider_pos) {
-            Log_Event(4, slider_pos, (cur_B & 0x38), g_diag.motor_speed_pct);
+            Log_Event(4, slider_pos, (cur_B & 0x38), g_pets.close_delay_ms);
             slider_feedback_pos = slider_pos;
             slider_feedback_until = now + 600;
             prev_slider_pos = slider_pos;
@@ -898,7 +965,7 @@ int main(void)
         }
 
         if (g_diag.add_pet_mode) {
-            /* Add Pet Mode: keep antenna active until a valid FDX-B chip is learned or 60s timeout */
+            /* Official Add Pet Mode: lid stays open, LED flashes green 1Hz, antenna scans until chip is learned */
             if (g_diag.lid_state != LID_OPENING && g_diag.lid_state != LID_CLOSING) {
                 RFID_Chip_Sweep();
             }
@@ -906,28 +973,25 @@ int main(void)
                 Pets_Add(g_fdxb.raw_id64);
                 Log_Event(7, 4, (uint32_t)(g_fdxb.raw_id64 & 0xFFFFFFFFULL), g_pets.count);
                 g_diag.add_pet_mode = 0U;
-                g_diag.learn_mode = 0U;
                 RFID_Learn_Stop();
                 RFID_Power_Down();
-                learn_success_until = HAL_GetTick() + 2500U;
-            } else if ((int32_t)(now - add_pet_deadline) >= 0) {
-                g_diag.add_pet_mode = 0U;
-                g_diag.learn_mode = 0U;
-                RFID_Learn_Stop();
-                RFID_Power_Down();
+                ir_last_blocked_time = HAL_GetTick();
+                learn_success_until = ir_last_blocked_time + 2500U;
             }
         } else if (g_diag.auto_mode_active) {
             if (g_diag.ir_blocked) {
                 ir_last_blocked_time = now;
                 if (g_diag.lid_state == LID_CLOSING) {
                     /* Safety re-open if pet breaks IR beam while lid is closing */
+                    motor_partial_close_ms = 0U;
                     Lid_Start_Opening(LID_OPEN_AUTO);
-                } else if (g_diag.lid_state == LID_CLOSED) {
+                } else if (g_diag.lid_state == LID_CLOSED && g_pets.training_stage != 1U) {
                     ir_rfid_active_until = now + 2000U;
                 }
             }
 
             uint8_t want_rfid = (g_diag.lid_state == LID_CLOSED &&
+                                 g_pets.training_stage != 1U &&
                                  (g_diag.ir_blocked ||
                                   (ir_rfid_active_until != 0U && (int32_t)(ir_rfid_active_until - now) > 0))) ? 1U : 0U;
 
@@ -943,6 +1007,7 @@ int main(void)
                         ir_rfid_active_until = 0U;
                         ir_last_blocked_time = HAL_GetTick();
                         RFID_Power_Down();
+                        motor_partial_close_ms = 0U;
                         Lid_Start_Opening(LID_OPEN_AUTO);
                     } else {
                         g_pets.last_authorized = 0U;
@@ -953,9 +1018,12 @@ int main(void)
                 if (s_rfid_powered || g_rfid.tx_enable) {
                     RFID_Power_Down();
                 }
-                if (g_diag.lid_state == LID_OPEN_AUTO && !g_diag.ir_blocked) {
-                    /* Auto-close lid 3.5s after pet leaves the IR arch */
-                    if ((now - ir_last_blocked_time) >= 3500U) {
+                if (g_diag.lid_state == LID_OPEN_AUTO && !g_diag.ir_blocked && g_pets.training_stage != 1U) {
+                    /* Auto-close lid after slider delay (3.5s / 6.0s / 10.0s) once pet leaves the IR arch */
+                    if ((now - ir_last_blocked_time) >= g_pets.close_delay_ms) {
+                        motor_partial_close_ms = (g_pets.training_stage == 2U) ? 250U :
+                                                 (g_pets.training_stage == 3U) ? 450U :
+                                                 (g_pets.training_stage == 4U) ? 650U : 0U;
                         Lid_Start_Closing();
                     }
                 }
@@ -980,11 +1048,21 @@ int main(void)
                 Log_Event(6, run_duration, pc4, g_diag.lid_state);
             }
 
-            /* Safety 4.0s timeout to protect motor */
-            if (run_duration >= 4000) {
+            /* Training Mode partial close target or 4.0s safety timeout */
+            if (g_diag.lid_state == LID_CLOSING && motor_partial_close_ms > 0U && run_duration >= motor_partial_close_ms) {
+                motor_partial_close_ms = 0U;
+                Lid_Stop_Motion(0);
+                g_diag.lid_state = LID_CLOSED;
+            } else if (run_duration >= 4000) {
+                motor_partial_close_ms = 0U;
                 Lid_Stop_Motion(2); /* 2 = Timeout */
                 if (g_diag.lid_state == LID_OPENING) {
-                    g_diag.lid_state = g_diag.target_open_mode;
+                    if (factory_reset_cycle_pending) {
+                        factory_reset_cycle_pending = 0U;
+                        Lid_Start_Closing();
+                    } else {
+                        g_diag.lid_state = g_diag.target_open_mode;
+                    }
                 } else {
                     g_diag.lid_state = LID_CLOSED;
                 }
@@ -997,10 +1075,16 @@ int main(void)
                 if ((motor_peak_pc4 >= 3450) && ((motor_peak_pc4 - pc4) >= g_stall_sag_threshold)) {
                     /* Mechanical end-stop reached! Cut motor immediately */
                     Log_Event(5, 14, (uint32_t)(motor_peak_pc4 - pc4), run_duration);
+                    motor_partial_close_ms = 0U;
                     Lid_Stop_Motion(1); /* 1 = Stall cutoff */
 
                     if (g_diag.lid_state == LID_OPENING) {
-                        g_diag.lid_state = g_diag.target_open_mode;
+                        if (factory_reset_cycle_pending) {
+                            factory_reset_cycle_pending = 0U;
+                            Lid_Start_Closing();
+                        } else {
+                            g_diag.lid_state = g_diag.target_open_mode;
+                        }
                     } else {
                         g_diag.lid_state = LID_CLOSED;
                     }
@@ -1008,11 +1092,20 @@ int main(void)
             }
         }
 
-        /* --- 8. Status LED Indication --- */
-        if (now < learn_success_until) {
-            /* Pet Learned Confirmation: Fast-Flashing GREEN (2.5s) */
-            if ((now / 120U) % 2U) LED_GREEN_ON(); else LED_GREEN_OFF();
+        /* --- 8. Status LED Indication (Official SureFeed Manual Behavior) --- */
+        if (now < factory_reset_led_until) {
+            /* Factory Reset: Alternating RED / GREEN */
+            if ((now / 150U) % 2U) {
+                LED_RED_ON();
+                LED_GREEN_OFF();
+            } else {
+                LED_RED_OFF();
+                LED_GREEN_ON();
+            }
+        } else if (now < learn_success_until) {
+            /* Microchip Learned / Read: Solid GREEN */
             LED_RED_OFF();
+            LED_GREEN_ON();
         } else if (now < unauth_feedback_until) {
             /* Unauthorized Chip Feedback: Fast-Flashing RED (1.0s) */
             if ((now / 120U) % 2U) LED_RED_ON(); else LED_RED_OFF();
@@ -1033,38 +1126,41 @@ int main(void)
                 LED_RED_ON();
                 LED_GREEN_OFF();
             }
-        } else if (g_diag.lid_state == LID_OPENING || g_diag.lid_state == LID_CLOSING) {
-            /* Lid in motion: Solid AMBER */
-            LED_RED_ON();
-            LED_GREEN_ON();
-        } else if (g_diag.lid_state == LID_OPEN_MANUAL) {
-            /* Manual Hold Open: Solid RED (automatic mode paused) */
-            LED_RED_ON();
-            LED_GREEN_OFF();
         } else if (g_diag.add_pet_mode) {
-            /* Add Pet Mode: Flashing ORANGE / AMBER (solid when chip signal detected) */
-            if (g_chip.detected_now || ((now / 250U) % 2U)) {
+            /* Official Add Pet / Learn Mode: Flashing GREEN once per second (1 Hz) */
+            if ((now % 1000U) < 500U) {
+                LED_GREEN_ON();
+            } else {
+                LED_GREEN_OFF();
+            }
+            LED_RED_OFF();
+        } else if (g_diag.lid_state == LID_OPEN_AUTO && g_pets.training_stage != 1U) {
+            /* Authorized Pet Eating / Microchip Read: Solid GREEN */
+            LED_RED_OFF();
+            LED_GREEN_ON();
+        } else if (g_pets.training_stage >= 1U && g_pets.training_stage <= 4U) {
+            /* Official Training Mode: Flashing ORANGE N times (1..4) per 2.4s cycle */
+            uint32_t phase = now % 2400U;
+            uint32_t pulse_idx = phase / 350U;
+            uint32_t pulse_rem = phase % 350U;
+            if (pulse_idx < g_pets.training_stage && pulse_rem < 180U) {
                 LED_RED_ON();
                 LED_GREEN_ON();
             } else {
                 LED_RED_OFF();
                 LED_GREEN_OFF();
             }
+        } else if (g_diag.lid_state == LID_OPEN_MANUAL) {
+            /* Manual Hold Open: Solid RED (automatic mode paused) */
+            LED_RED_ON();
+            LED_GREEN_OFF();
         } else if (g_diag.rfid_scan_active) {
             /* IR beam broken -> RFID Antenna Scanning: Flashing GREEN */
             if ((now / 150U) % 2U) LED_GREEN_ON(); else LED_GREEN_OFF();
             LED_RED_OFF();
-        } else if (g_diag.lid_state == LID_OPEN_AUTO) {
-            /* Authorized Pet Eating: Solid GREEN */
-            LED_RED_OFF();
-            LED_GREEN_ON();
         } else {
-            /* Low-Power Idle (RFID TX & RX OFF): Brief GREEN heartbeat flash every 3s */
-            if ((now % 3000U) < 50U) {
-                LED_GREEN_ON();
-            } else {
-                LED_GREEN_OFF();
-            }
+            /* Official Idle State (RFID TX & RX OFF): LED completely OFF */
+            LED_GREEN_OFF();
             LED_RED_OFF();
         }
     }

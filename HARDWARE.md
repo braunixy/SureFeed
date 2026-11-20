@@ -11,28 +11,42 @@
 
 ---
 
-## 1. Pinout Mapping Table
+## 1. Master STM32L071VZT6 (LQFP100) Pinout Mapping Table
 
-| STM32 Pin # | GPIO / Function | Circuit Net / Component | Function Description |
-| :---: | :---: | :---: | :--- |
-| **78** | `PC10` | Green LED Cathode | **Status LED - Green** (Active LOW: LOW = ON, HIGH = OFF) |
-| **77** | `PA15` | Red LED Cathode | **Status LED - Red** (Active LOW: LOW = ON, HIGH = OFF, Green + Red = **Orange / Amber**) |
-| **23** | `PA1` (`ADC_IN1`) | Daughterboard Button Bus | **Shared Analog Button Line** (All 3 buttons: SW1, SW2, SW3 with internal/external ~2.2k pull-down) |
-| **89, 90, 91** | `PB3`, `PB4`, `PB5` | Slider Switch Throws (Inputs) | **3-Position Delay Switch Sense**: PB3 = Pos 1 (Fast), PB4 = Pos 2 (Medium), PB5 = Pos 3 (Slow) |
-| **3** | `PE4` | Slider Switch Wiper (Drive LOW) | **Active Ground Return Rail** (Driven LOW / 0V by MCU) |
-| **42** | `PE11` | Gate Driver / H-Bridge A | **Motor Drive A** (Lid Open Direction) |
-| **43** | `PE12` | Gate Driver / H-Bridge B | **Motor Drive B** (Lid Close Direction) |
-| **33** | `PC4` (`ADC_IN14`) | H-Bridge Supply Rail Sense | **Motor Current / Supply Sag Monitor** (Detects stall cutoff via rail voltage sag) |
-| **63** | `PC6` (`TIM22_CH1` / `TIM3_CH1`) | Gate Driver `Q807` via `R825` ($220\ \Omega$) | **IR Pet Arch Emitter LED 1** (Active HIGH: drives Q807 to sink cathode) |
-| **64** | `PC7` (`TIM22_CH2` / `TIM3_CH2`) | Gate Driver `Q806` via `R821` ($220\ \Omega$) | **IR Pet Arch Emitter LED 2** (Active HIGH: drives Q806 to sink cathode) |
-| **65** | `PC8` | Gate Driver `Q801` | **IR Receiver Gate / Enable** (Active LOW: 0V enables receiver, 3.3V clamps to GND) |
-| **35** | `PB0` (`ADC_IN8`) | Demodulator Output via `R808` / `IC301` | **IR Receiver Analog Signal** (Pulsed transimpedance optical voltage drop) |
-| **76** | `PA14` | SWCLK / Debug Header | **SWD Clock** (Serial Wire Debug) |
-| **72** | `PA13` | SWDIO / Debug Header | **SWD Data I/O** (Serial Wire Debug) |
-| **14** | `NRST` | Reset Pad / Pushbutton | **Target Hardware Reset** (Active Low) |
-| **74** | `VSS` / GND | Ground Plane | System Digital & Power Ground |
-| **75** | `VDD` | 3.3V Power Rail | System VDD (Regulated from 4× C-cell batteries) |
-| **22** | `VDDA` | 3.3V Analog Power Rail | Analog Reference & Daughterboard Button Power Source |
+| STM32 Pin # | GPIO / Function | Subsystem | Circuit Net / Component | Function Description |
+| :---: | :---: | :---: | :--- | :--- |
+| **3** | `PE4` | UI Slider | Slider Switch Wiper (Drive LOW) | **Active Ground Return Rail** for 3-Position Lid Delay Slider (`0V` output) |
+| **11** | `PH10` | RFID Clock | `IC103.1` (`VHE` Enable) & `R108` ($10\text{ k}\Omega$) | **32.000 MHz Master Crystal Buffer Enable** (`HIGH` / Pull-Up = ON, `LOW` = OFF) |
+| **12** | `PH0-OSC_IN` | RFID Clock | `IC103` Output via `R10` | **32.000 MHz External Clock Input (`HSE_BYPASS`)** from `Y101` crystal via `IC103` |
+| **14** | `NRST` | System / SWD | `C113.1` & Reset Pad | **Target Hardware Reset** (Active LOW) |
+| **16** | `PC1` (`ADC_IN11`) | RFID RX | `R111` / `R112` Divider & `C121` from `Q703.3` | **RFID RX Switched Power Rail Monitor** ($\approx 2840\text{ counts}$ when `PB11 = HIGH`, $0$ when OFF) |
+| **21** | `VREF+` | Analog Power | `C855.1` Decoupling to `VSS` | **ADC Positive Reference Voltage** ($+3.3\text{V}$) |
+| **22** | `VDDA` | Analog Power | `C856.1` & Daughterboard `Conn1.1` | **3.3V Analog Supply & Button Divider Source** |
+| **23** | `PA1` (`ADC_IN1`) | UI Buttons | Daughterboard `Conn1.5` Button Bus | **Shared Analog Button Line** (`SW1` Add Pet, `SW2` Open/Close, `SW3` Training Mode) |
+| **29** | `PA4` (`ADC_IN4`) | RFID RX | `IC701.8` (`OUT3`) $\rightarrow$ `R717` $\rightarrow$ `D102.1` | **RFID RX Cascaded Bandpass Output** ($+3.3\text{V}$ clamped via `D102.3`) |
+| **30** | `PA5` (`ADC_IN5`) | RFID RX | `IC701.7` (`OUT2`) $\rightarrow$ `R720` $\rightarrow$ `C714.1` $\rightarrow$ `D102.2` | **RFID RX Primary FDX-B Baseband Demodulator Input** ($4,193.75\text{ bps}$ DBP waveform) |
+| **31** | `PA6` (`ADC_IN6`) | RFID RX | `IC702.14` (`OUT4`) / `IC704.4` Filter Stage | **RFID RX Secondary Envelope / Filter Stage Output** |
+| **32** | `PA7` (`ADC_IN7`) | RFID Tuner | `D604.2` $\rightarrow$ `R613` / `R614` Divider & `C621` | **RFID Tank Envelope Amplitude Feedback** (Closed-loop AGC input for `PB13`/`PB14` servo) |
+| **33** | `PC4` (`ADC_IN14`) | Motor Drive | H-Bridge Supply Rail Sense | **Motor Current / Supply Sag Monitor** (End-stop stall cutoff detection) |
+| **35** | `PB0` (`ADC_IN8`) | IR Gate RX | `Q803.3` Collector via `R808` $\parallel$ `C805` | **IR Break-Beam Channel B Analog Output** (Right Receiver `PAD_R`, paired with `PC6` LED 1) |
+| **36** | `PB1` (`ADC_IN9`) | IR Gate RX | `Q805.3` Collector via `R817` $\parallel$ `C810` | **IR Break-Beam Channel A Analog Output** (Left Receiver `PAD_L`, paired with `PC7` LED 2) |
+| **37** | `PB2` | RFID Tuner | `R605.1` $\rightarrow$ `Q607.1` (`6CW` NPN Base) | **RFID Tank High-Range Bias Switch** (Couples `Q607.3` $\leftrightarrow$ `Q607.2` / `C604.1`) |
+| **40** | `PE9` (`TIM2_CH1`) | RFID TX | `IC102.1` (`SN74LVC1G79` Data `D` Input) | **134.2 kHz RFID TX Carrier Output** (`AF0`, re-clocked to $32.000\text{ MHz}$ `Y101` by `IC102`) |
+| **42** | `PE11` | Motor Drive | H-Bridge Gate A | **Motor Drive A** (Lid Open Direction) |
+| **43** | `PE12` | Motor Drive | H-Bridge Gate B | **Motor Drive B** (Lid Close Direction) |
+| **48** | `PB11` | RFID RX | `R701.1` $\rightarrow$ `Q702.1` $\rightarrow$ `Q703` High-Side Switch | **RFID RX Op-Amp Power & `V_REF` Enable** (`HIGH` = RX Chain Powered ON, `LOW` = $0\ \mu\text{A}$ OFF) |
+| **49, 74** | `VSS` / GND | Power | System Ground Plane (`IC102.3`, `PAD_M`, etc.) | **System Digital & Analog Ground** |
+| **50, 75** | `VDD` / `VDDIO2` | Power | $+3.3\text{V}$ Regulated Rail (`IC102.5`, `D102.3`) | **System $+3.3\text{V}$ Logic Supply** |
+| **52** | `PB13` | RFID Tuner | `C603.1` $\rightarrow$ `R603` / `D602` / `Q602` $\rightarrow$ `C604.2` | **RFID Tank Gate Charge-Pump DOWN (Discharge)** (AC-coupled; pulses step `Q603` gate DOWN) |
+| **53** | `PB14` | RFID Tuner | `C602.1` $\rightarrow$ `R602` / `D601` / `Q601` $\rightarrow$ `C604.2` | **RFID Tank Gate Charge-Pump UP (Charge)** (AC-coupled; pulses step `Q603` gate UP) |
+| **63** | `PC6` | IR Gate TX | `R825` ($220\ \Omega$) $\rightarrow$ `Q807` (`6CW` NPN Base) | **IR Pet Arch Emitter LED 1** (`HIGH` = sinks LED 1 cathode from `C812` reservoir) |
+| **64** | `PC7` | IR Gate TX | `R821` ($220\ \Omega$) $\rightarrow$ `Q806` (`6CW` NPN Base) | **IR Pet Arch Emitter LED 2** (`HIGH` = sinks LED 2 cathode from `C812` reservoir) |
+| **65** | `PC8` | IR Gate RX | High-Side Switch `Q801` Base | **IR Receiver Power Enable** (Active LOW: `0V` turns `Q801` ON to power `NET 7` $V_{\text{CC\_IR}}$) |
+| **72** | `PA13` | Debug / SWD | SWDIO Pad | **Serial Wire Debug Data I/O** |
+| **76** | `PA14` | Debug / SWD | SWCLK Pad | **Serial Wire Debug Clock** |
+| **77** | `PA15` | UI LED | Daughterboard `Conn1.3` Red LED Cathode | **Status LED - Red** (Active LOW: `LOW` = ON, `HIGH` = OFF) |
+| **78** | `PC10` | UI LED | Daughterboard `Conn1.4` Green LED Cathode | **Status LED - Green** (Active LOW: `LOW` = ON, `HIGH` = OFF; Green + Red = **Orange / Amber**) |
+| **89, 90, 91** | `PB3`, `PB4`, `PB5` | UI Slider | Slider Switch Throws (`I`, `II`, `III`) | **3-Position Lid Close Delay Sense** (`PB3` = Pos `I` $3.5\text{s}$, `PB4` = Pos `II` $6.0\text{s}$, `PB5` = Pos `III` $10.0\text{s}$) |
 
 ---
 
@@ -212,4 +226,60 @@ The user controls on the daughterboard connect via a 5-pin ribbon cable:
 * **Verified Hardware Tag Reads (`100%` CRC-16 Match):**
   * **SureFlap Tag 1:** `051-073300800864` (`raw_id64 = 0x80000cd111117560`, `CRC = 0x0e19 == 0x0e19`, $33/33$ frames valid)
   * **SureFlap Tag 2:** `051-073300800887` (`raw_id64 = 0x80000cd111117577`, `CRC = 0xc96f == 0xc96f`)
+
+---
+
+## 4. Official SureFeed User Manual Parity & Workflow Specification
+
+| Feature / Workflow | Official SureFeed Manual | Firmware Implementation ([`src/main.c`](src/main.c)) | Parity Status |
+| :--- | :--- | :--- | :--- |
+| **Max Learned Pets** | Up to **32** pet microchip IDs stored in permanent non-volatile memory. | Up to **32** pet IDs (`MAX_LEARNED_PETS = 32`) persisted in STM32L0 Data EEPROM (`0x08080000`). | **Exact Match** |
+| **Normal Daily Operation (IR + RFID)** | Proximity/IR sensor in the hoop detects a pet approaching $\rightarrow$ activates the RFID reader $\rightarrow$ opens lid if microchip is authorized $\rightarrow$ keeps lid open while pet remains in hoop $\rightarrow$ closes lid after pet walks away. | Pulsed IR break-beam (`IR_Sample_Pulsed`) detects pet in arch (`ir_blocked = 1`) $\rightarrow$ powers up RFID antenna (`RFID_Power_Up`) $\rightarrow$ opens lid (`LID_OPEN_AUTO`) if `Pets_Is_Authorized` $\rightarrow$ powers off antenna while open $\rightarrow$ closes after IR clears for slider delay (`3.5s / 6.0s / 10.0s`). | **Exact Match** |
+| **"Add Pet" (`SW1`, `BTN_ADD_PET`) Sequence** | 1. Press **Add Pet** $\rightarrow$ **lid automatically opens** and LED **flashes green** ($1\text{ Hz}$). Stays in Add Pet mode until a chip is read (or pressed again to cancel).<br>2. Pet approaches to eat $\rightarrow$ chip is read $\rightarrow$ LED turns **solid green** while pet eats.<br>3. When pet steps away (IR clears), **lid closes** and LED turns **off**. | 1. Press **Add Pet** $\rightarrow$ lid automatically opens (`Lid_Start_Opening(LID_OPEN_AUTO)`), LED **flashes green** ($1\text{ Hz}$), and RFID antenna scans continuously.<br>2. When chip is read (`crc_ok_count` increments) $\rightarrow$ ID saved to `g_pets` + Data EEPROM, antenna turns off, LED turns **solid green**.<br>3. When pet leaves (`ir_blocked = 0` for slider close delay), lid closes and LED turns **off**. | **Exact Match** |
+| **Factory Reset (Erase All Pets)** | Hold **Add Pet** button for **$\sim 10\text{ seconds}$** $\rightarrow$ LED alternates **red / green** and lid cycles open & closed once $\rightarrow$ all learned pets wiped from memory. | Holding `BTN_ADD_PET` continuously for $\ge 10.0\text{ s}$ (`10000 ms`) wipes `g_pets` + Data EEPROM, alternates **red / green** LED ($150\text{ ms}$) for $3.0\text{ s}$, and cycles the lid open and closed once (`factory_reset_cycle_pending = 1`). | **Exact Match** |
+| **3-Position Slider (`I / II / III`, `PB3..PB5`)** | **Lid Close Delay Slider:** controls how long the lid waits to close *after* the pet steps away (`I` = Short delay, `II` = Standard delay, `III` = Long delay). | Mapped to `g_pets.close_delay_ms`:<br>• **Position `I` (`PB3 = 0`):** **`3.5 s`** (`3500 ms`)<br>• **Position `II` (`PB4 = 0`):** **`6.0 s`** (`6000 ms`)<br>• **Position `III` (`PB5 = 0`):** **`10.0 s`** (`10000 ms`) | **Exact Match** |
+| **"Training Mode" Button (`SW3`, `BTN_LEARN`)** | Cycles through **4 gradual training stages** (flashing **orange** $1\times, 2\times, 3\times, 4\times$) where the lid stays partially open / closes only partially so timid pets get used to lid movement; pressing once more exits Training Mode and closes the lid fully. | Pressing `BTN_LEARN` cycles `g_pets.training_stage` (`0 -> 1 -> 2 -> 3 -> 4 -> 0`), flashing **orange** $N\times$ ($1..4$ pulses per $2.4\text{ s}$ cycle):<br>• **Stage 1:** Lid stays $100\%$ open continuously.<br>• **Stage 2:** Closes partially ($250\text{ ms}$ from open, $\sim 75\%$ open); opens to $100\%$ for authorized pet.<br>• **Stage 3:** Closes to $\sim 50\%$ open ($450\text{ ms}$); opens to $100\%$ for authorized pet.<br>• **Stage 4:** Closes to $\sim 25\%$ open ($650\text{ ms}$); opens to $100\%$ for authorized pet.<br>• **Exit (`Stage 0`):** Closes lid $100\%$ to end-stop and resumes normal mode. | **Exact Match** |
+| **Open / Close Button (`SW2`, `BTN_OPEN_CLOSE`)** | Opens the lid manually for refilling/cleaning bowls; pressing again closes the lid and resumes normal automatic operation. | Opens lid manually (`LID_OPEN_MANUAL`, pausing auto mode); pressing again closes lid and resumes `auto_mode_active = 1`. | **Exact Match** |
+| **Idle & Active LEDs** | • **Idle:** LED completely **OFF**.<br>• **Add Pet Mode:** **Flashing Green** ($1\text{ Hz}$).<br>• **Eating / Read:** **Solid Green**.<br>• **Training Mode:** **Flashing Orange** ($1\times\text{--}4\times$).<br>• **Factory Reset:** **Alternating Red / Green**. | • **Idle:** LED completely **OFF**.<br>• **Add Pet Mode:** **Flashing Green** ($1\text{ Hz}$).<br>• **Eating / Read:** **Solid Green**.<br>• **Training Mode:** **Flashing Orange** ($1\times\text{--}4\times$).<br>• **Factory Reset:** **Alternating Red / Green**. | **Exact Match** |
+
+---
+
+## 5. Complete Reverse-Engineered PCB Component BOM & Verified Netlist Reference
+
+### 5.1 100-Series Master Clock, Re-Clocking & ADC Clamp Components
+| RefDes | Marking / Value | Package / Type | Verified Pin Connections & Function |
+| :--- | :--- | :--- | :--- |
+| **`Y101`** | `32.000 MHz` | 4-Pad SMD Crystal | `Pin 1`: `R107.1` / `IC103` input; `Pin 3`: `C110.1`; `Pins 2, 4`: `VSS` |
+| **`IC103`** | `VHE` | SOT-23-5 Gate Buffer | `Pin 1 (EN)`: `U1.11` (`PH10`) & `R108.1`; `Pin 3 (GND)`: `VSS` (`R108.2`, `C110.2`, `R105.2`); `Output`: via `R10` to `U1.12` (`PH0-OSC_IN`) |
+| **`IC102`** | `C79J` (`SN74LVC1G79`) | SOT-23-5 D Flip-Flop | `Pin 1 (D)`: `U1.40` (`PE9`); `Pin 2 (CLK)`: `R107.2` / `R105.1` ($32.000\text{ MHz}$); `Pin 3 (GND)`: `U1.49` (`VSS`, `C105.2`); `Pin 4 (Q)`: `D603.3`, `R609.1`, `R610.1`; `Pin 5 (VCC)`: `U1.50` (`+3.3V`, `C105.1`, `C115.1`) |
+| **`D102`** | Dual Series Diode | SOT-23-3 | `Pin 1`: `U1.29` (`PA4`), `R717.2`, `C711.1`; `Pin 2`: `U1.30` (`PA5`), `C714.1`, `R720.2`; `Pin 3`: `U1.75` (`VDD_3V3` $+3.3\text{V}$ clamp rail) |
+| **`R111`, `R112`, `C121`** | Divider | 0603 SMD | `R111.2`: `Q703.3` (`NET_R706_1`); `R111.1` / `R112.1` / `C121.1`: `U1.16` (`PC1`); `R112.2` / `C121.2`: `VSS` |
+
+### 5.2 600-Series RFID TX Driver & Closed-Loop High-Voltage Tank Tuner Netlist
+| RefDes | Marking / Value | Package / Type | Verified Pin Connections & Function |
+| :--- | :--- | :--- | :--- |
+| **`IC601`** | Gate Driver A | SOT-23-5 | `Pins 1, 2 (IN)`: `R609.2`, `C617.1`, `D603.1`; `Pin 3 (GND)`: `C617.2`, `C618.2`, `VSS`; `Pin 4 (OUT)`: `R611.1` ($\rightarrow$ `Q606.3`); `Pin 5 (VCC)`: `R615.1` ($+6\text{V}$ via $100\ \Omega$), `C622.2`, `C623.1` |
+| **`IC602`** | Gate Driver B | SOT-23-5 | `Pins 1, 2 (IN)`: `R610.2`, `C618.1`, `D603.2`; `Pin 3 (GND)`: `C618.2`, `VSS`; `Pin 4 (OUT)`: `R612.1` ($\rightarrow$ `Q606.1`); `Pin 5 (VCC)`: `R615.1`, `C623.1` |
+| **`D603`** | Dual Diode | SOT-23-3 | `Pin 1`: `C617.1` / `R609.2`; `Pin 2`: `C618.1` / `R610.2`; `Pin 3`: `IC102.4` (`Q`), `R609.1`, `R610.1` |
+| **`Q606`** | Dual/Comp FET | SOT-23-6 | `Pin 1`: `R612.2`; `Pin 2`: `D606.1/2` & `D605.1(K)`; `Pin 3`: `R611.2`; `Pins 4, 6`: **`TPA1`** (`A601`) & `C619.2` |
+| **`D606`, `D605`** | Supply Diodes | SOT-23-3 / SOD-323 | `D606.1/2` & `D605.1(K)`: `Q606.2`; `D606.3`: `C724.1`; `D605.2(A)`: `C625.2`, `R616.2` ($0.47\ \Omega$), `C626.2` ($220\ \mu\text{F}\ 16\text{V}$) |
+| **`TPA1`, `TPA0`** | Antenna Pads | Solder Pads | **`TPA1`**: `Q606.4/6`, `C619.2` (`C619.1` = `VSS`); **`TPA0`**: Antenna Coil return ($<1\ \Omega$ DC through coil) |
+| **`Q603`** | `FQD6N40C` | DPAK-3 (400V N-FET) | `Pin 1 (Gate)`: `R604.1` ($\leftarrow$ `C604.2`, `Q601.3`, `Q602.3`); `Pin 2 (Source)`: `C607.1`, `C605.1`, `Q604.2`; `Pin 3 (TAB/Drain)`: `C607.2`, `C609.2`, `C610.2`, `C612.2`, `C8613.2`, `D604.3` |
+| **`D604`** | `KAE` (Dual Diode) | SOT-23-3 | `Pin 3 (COM)`: `Q603.3 (TAB)` & tank capacitor bank `C607.2`/`C609.2`/`C610.2`/`C612.2`/`C8613.2`; `Pin 1`: `R601.1` ($\rightarrow$ `C601.2`/`Q601.2`); `Pin 2 (Rectified Envelope)`: `C620.2` (to `GND_8`), `R613.1` ($\rightarrow$ `PA7`), `C706.2` ($\rightarrow$ `IC701.3`) |
+| **`R613`, `R614`, `C621`** | `PA7` Divider | 0402 / 0603 SMD | `R613.1`: `D604.2`; `R613.2` / `R614.2` / `C621.2`: `U1.32` (`PA7`); `R614.1` / `C621.1`: `GND_8` (`VSS`) |
+| **`C602`, `R602`, `D601`, `Q601`** | `PB14` UP Pump | 0603 / SOT-23-3 | `C602.1`: `U1.53` (`PB14`); `C602.2`: `R602.2`, `Q601.1`, `D601.3`; `Q601.2`: `D601.1`, `R602.1`, `C601.2`, `R601.2`; `Q601.3`: `C604.2`, `R604.2`, `Q602.3` |
+| **`C603`, `R603`, `D602`, `Q602`** | `PB13` DOWN Pump | 0603 / SOT-23-3 | `C603.1`: `U1.52` (`PB13`); `C603.2`: `R603.2`, `D602.1`, `Q602.1`; `D602.3`: `GND_8` (`VSS`); `Q602.2`: `C601.1`, `R617.1`; `Q602.3`: `Q601.3`, `C604.2`, `R604.2`; `R603.1`: `C604.1` |
+| **`Q607`, `R605`, `R617`, `R618`** | `PB2` Bias Switch | SOT-23-3 (`6CW`) | `R605.1`: `U1.37` (`PB2`); `R605.2`: `Q607.1 (Base)`; `Q607.2`: `C611.1`, `R606.2`, `C606.1`, `C604.1`; `Q607.3`: `R618.1`, `R617.2` (`R617.1` = `C601.1`); `R618.2`: `C605.2`, `C606.2`, `Q604.1` |
+| **`Q604`, `R606`, `C605`–`C613`** | Tank Switch Network | SOT-23-3 / 1206 / 0805 | `Q604.1`: `C605.2`, `C606.2`, `R618.2`; `Q604.2`: `C605.1`, `C607.1`, `Q603.2`; `Q604.3`: `R606.1`, `C611.2`, `C609.1`, `C610.1` |
+
+### 5.3 700-Series RFID RX Amplifier, Bandpass Filter & Slicer Netlist
+| RefDes | Marking / Value | Package / Type | Verified Pin Connections & Function |
+| :--- | :--- | :--- | :--- |
+| **`Q702`, `Q703`, `R701`–`R708`** | `PB11` Power & `V_REF` | SOT-23-3 / 0402 | `R701.1`: `U1.48` (`PB11`); `R701.2`: `Q702.1`; `Q702.3`: `R702.2`, `Q703.1`; `Q703.3`: `R703.1`, `R706.1`, `C702.2`, `R111.2`, `R721.2`; `Q703.2`: `R702.1`, `R708.2`, `C731.1`, **`V_REF`** (`IC701.5,10,12` & `IC702.3,5,10,12`) |
+| **`D701`, `C706`, `R704`, `R705`** | RX Front-End Clamp | SOT-23-3 / 0603 | `C706.2`: `D604.2` / `C620.2`; `C706.1`: `R704.2`; `R704.1`: `D701.3`, `IC701.3`, `R705.1` (`R705.2` = `V_REF`); `D701.1`: `C619.1` (`VSS`), `R897.1`; `D701.2`: `IC701.4` / `IC702.4` (`VCC`) |
+| **`IC701`** | `TL974I` (Quad Op-Amp 1) | TSSOP-14 | • **Op-Amp 1 (Follower):** `Pin 3 (1IN+)` = `D701.3`; `Pin 1 (OUT1)` = `Pin 2 (1IN-)`, `C712.2`, `R711.2`, `R722.2`<br>• **Op-Amp 2 ($\rightarrow$ `PA5`):** `Pin 5 (2IN+)` = `V_REF`; `Pin 6 (2IN-)` = `R718.1` ($\leftarrow$ `C712.1`), `C713.1`, `R719.2`; `Pin 7 (OUT2)` = `C713.2`, `R719.1`, `R720.1` ($\rightarrow$ `C714.1` / `D102.2` / **`PA5`**)<br>• **Op-Amp 4:** `Pin 12 (4IN+)` = `V_REF`; `Pin 13 (4IN-)` = `C708.2`, `R713.2`; `Pin 14 (OUT4)` = `C707.2`, `R713.1`, `R714.2`<br>• **Op-Amp 3 ($\rightarrow$ `PA4`):** `Pin 10 (3IN+)` = `V_REF`; `Pin 9 (3IN-)` = `C710.1`, `R716.2`; `Pin 8 (OUT3)` = `R716.1`, `C709.1`, `R717.1` ($\rightarrow$ `C711.1` / `D102.1` / **`PA4`**)<br>• **Power:** `Pin 4 (VCC)` = `D701.2`, `C705.1`, `C701.2`; `Pin 11 (GND)` = `VSS` |
+| **`IC702`** | `TL974I` (Quad Op-Amp 2) | TSSOP-14 | • **Op-Amp 1:** `Pin 3 (1IN+)` = `V_REF`; `Pin 2 (1IN-)` = `C717.1`, `R724.1`; `Pin 1 (OUT1)` = `R724.2`, `C718.1`, `R725.1`<br>• **Op-Amp 2:** `Pin 5 (2IN+)` = `V_REF`; `Pin 6 (2IN-)` = `R727.1`, `C719.1`; `Pin 7 (OUT2)` = `R727.2`, `C720.1`, `R728.2`<br>• **Op-Amp 3:** `Pin 10 (3IN+)` = `V_REF`; `Pin 9 (3IN-)` = `R730.2`, `C721.2`; `Pin 8 (OUT3)` = `R730.1`, `C722.2`, `Q704.1`<br>• **Op-Amp 4 ($\rightarrow$ `PA6`):** `Pin 12 (4IN+)` = `V_REF`; `Pin 13 (4IN-)` = `R738.2`, `C730.2`; `Pin 14 (OUT4)` = `R739.2`, `C730.1` |
+| **`Q704`, `IC703`, `IC704`** | Slicer / Filter Stages | SOT-23-3 / SOT-23-5 | `Q704.1`: `C722.2`, `R730.1`, `IC702.8`; `Q704.2`: `R731.1`, `C723.2`; `Q704.3`: `R732.2`, `C724.2`; `IC703.1`: `R734.2`; `IC703.3`: `R734.1`, `C726.1`; `IC703.5`: `C725.1`, `R733.1`, `R735.2`; `IC703.4`: `R735.1`, `IC704.1`; `IC704.4`: `R736.2` ($\rightarrow$ `C727.1` / `C728.1` $\rightarrow$ `R737` $\rightarrow$ `C729.2`); `IC704.5`: `C716.2`, `R721.1` |
+
+
 
