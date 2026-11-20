@@ -135,6 +135,99 @@ volatile DiagnosticLog g_diag = {
 volatile uint16_t g_stall_sag_threshold = 90;
 volatile uint16_t g_stall_threshold = 4096;
 
+typedef struct {
+    uint32_t tx_enable;         /* 1 = 134.2 kHz TIM2_CH1 PWM active on PE9 */
+    uint32_t tx_arr;            /* TIM2->ARR (237 -> 134.45 kHz at 32 MHz) */
+    uint32_t tx_sweep_count;    /* Number of TX scan sweeps completed */
+    uint32_t reset_peaks;       /* Set to 1 via GDB to clear latched peaks */
+
+    /* Pin classification across [0]=A, [1]=B, [2]=C, [3]=D, [4]=E, [5]=H */
+    uint16_t pin_pup[6];        /* IDR with internal PULLUP */
+    uint16_t pin_pdn[6];        /* IDR with internal PULLDOWN */
+    uint16_t idle_toggled[6];   /* Digital transitions observed with TX OFF */
+    uint16_t tx_toggled[6];     /* Digital transitions observed with TX ON */
+    uint32_t ph_idr_hist[4];    /* GPIOH IDR snapshots at boot */
+
+    /* 16 ADC channels [0..15] = PA0..7, PB0..1, PC0..5 */
+    uint16_t adc_idle_min[16];
+    uint16_t adc_idle_max[16];
+    uint16_t adc_idle_avg[16];
+
+    uint16_t adc_tx_min[16];
+    uint16_t adc_tx_max[16];
+    uint16_t adc_tx_avg[16];
+    uint16_t adc_tx_span[16];   /* Current sweep (max - min) */
+    uint16_t adc_peak_span[16]; /* Max latched span while TX ON */
+} RfidPinScan;
+
+volatile RfidPinScan g_rfid = {
+    .tx_enable = 0,
+    .tx_arr = 237,
+    .tx_sweep_count = 0,
+    .reset_peaks = 0
+};
+
+typedef struct {
+    uint32_t sweep_count;
+    uint32_t active_arr;         /* Current TIM2->ARR: 237 (134.45 kHz), 340 (93.8 kHz), 255 (125 kHz) */
+    uint32_t reset_latch;        /* Set to 1 to clear latched detection */
+    uint32_t detected_now;       /* 1 if current sweep detected FDX-B intervals */
+
+    /* Live measurements (updated continuously) on PA4, PA5, PA6, PA7 */
+    uint16_t edges_15ms[3];      /* Total edges (rising+falling) in 15ms on PA4, PA5, PA6 */
+    uint16_t cnt_119us[3];       /* Edge intervals in [90..150 us] (FDX-B half-bit) */
+    uint16_t cnt_238us[3];       /* Edge intervals in [200..280 us] (FDX-B full-bit) */
+    uint16_t fdxb_score[3];      /* Valid purity-weighted score on PA4, PA5, PA6 */
+    uint16_t live_avg[4];        /* PA4, PA5, PA6, PA7 ADC avg */
+    uint16_t live_span[4];       /* PA4, PA5, PA6, PA7 ADC span */
+    uint16_t pa7_peak_span;      /* Peak span seen on PA7 */
+    uint16_t pa7_min_seen;
+    uint16_t pa7_max_seen;
+
+    /* Latched best FDX-B detection */
+    uint32_t best_score;
+    uint32_t best_pin;           /* 4=PA4, 5=PA5, 6=PA6 */
+    uint32_t best_arr;
+    uint16_t best_pa7_avg;
+    uint16_t latched_dt_us[64];  /* Consecutive edge-to-edge pulse widths in us */
+    uint16_t latched_wave[64];   /* Slow ADC burst (~11 us/sample = 700 us) on best_pin */
+} RfidChipTest;
+
+volatile RfidChipTest g_chip = {
+    .active_arr = 237,
+    .pa7_min_seen = 4095,
+    .pa7_max_seen = 0
+};
+
+typedef struct {
+    uint8_t hse_active;
+    uint8_t pad0;
+    uint16_t pa0_low_pa7;
+    uint16_t pa0_high_pa7;
+    uint16_t steady_arr[10];
+    uint16_t steady_pa7[10];
+    uint16_t steady_pc4[10];
+    uint16_t fast_burst_us;
+    uint16_t fast_pa4[48];
+    uint16_t fast_pa5[48];
+    uint16_t fast_pa6[48];
+
+    /* Manual chip snapshot triggered by BTN_ADD_PET */
+    uint32_t snap_count;
+    uint32_t snap_arr;
+    uint16_t snap_pa7;
+    uint16_t snap_edges[3];
+    uint16_t snap_119[3];
+    uint16_t snap_238[3];
+    uint16_t snap_avg[4];
+    uint16_t snap_span[4];
+    uint16_t snap_pa5[48];
+    uint16_t snap_pa6[48];
+} RfDiag;
+
+volatile RfDiag g_rfdiag = {0};
+volatile uint8_t g_snap_req = 0;
+
 /* Status LEDs: Both are Active LOW (RESET = ON, SET = OFF) */
 #define LED_GREEN_ON()   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_RESET)
 #define LED_GREEN_OFF()  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_10, GPIO_PIN_SET)
@@ -163,6 +256,181 @@ static uint16_t motor_peak_pc4 = 0;
 static uint32_t stall_feedback_until = 0;
 static uint32_t last_run_log_time = 0;
 
+typedef struct {
+    uint16_t ph_or;
+    uint16_t ph_and;
+    uint8_t  hserdy_hi;
+    uint8_t  hserdy_lo;
+    uint32_t ssr_delta_hi_4ms;
+    uint32_t ssr_delta_lo_4ms;
+    uint32_t ph0_est_khz_hi;
+    uint16_t gpio_nop[6];
+    uint16_t gpio_pup[6];
+    uint16_t gpio_pdn[6];
+    uint16_t wide_arr[45];
+    uint16_t wide_pa7[45];
+    uint16_t wide_pc4[45];
+    uint16_t wide_pa4_span[45];
+    uint16_t fast340_pa4[48];
+    uint16_t fast350_pa4[48];
+    uint16_t fast360_pa4[48];
+    uint16_t fast350_us;
+    uint16_t sub_arr[17];
+    uint16_t sub_pa7[17];
+    uint16_t edges_arr[4]; /* 237, 340, 350, 360 */
+} RfDiag2;
+volatile RfDiag2 g_rfdiag2;
+
+typedef struct {
+    uint8_t  pb2_nop_off;
+    uint8_t  pb2_pup_50ms;
+    uint8_t  pb2_nop_237;
+    uint8_t  ph1_pup_50ms;
+    uint16_t pb2_lo_pa7;
+    uint16_t pb2_hi_pa7;
+    uint16_t ph1_lo_pa7;
+    uint16_t ph1_hi_pa7;
+    uint16_t duty_ccr[11];
+    uint16_t duty_pa7[11];
+    uint16_t duty_pa4_span[11];
+    uint16_t pc0_237;
+    uint16_t pc1_237;
+    uint16_t pc0_350;
+    uint16_t pc1_350;
+    uint16_t fast350_pa5[24];
+    uint16_t fast350_pa6[24];
+    uint16_t pp_hi_hit_port;
+    uint16_t pp_hi_hit_pin;
+    uint16_t pp_hi_pa7;
+    uint16_t pp_hi_base_pa7;
+} RfDiag3;
+volatile RfDiag3 g_rfdiag3;
+
+typedef struct {
+    /* Signal-flow probe: row i = pin tested (0=PA4,1=PA5,2=PA6,3=PC0,4=PC1) with 40k PDN vs PUP;
+       cols = resulting ADC avg on {PA4, PA5, PA6, PA7, PC0, PC1} + PB2 bit */
+    uint16_t base_adc[6];
+    uint16_t pdn_effect[5][6];
+    uint16_t pup_effect[5][6];
+    uint8_t  pdn_pb2[5];
+    uint8_t  pup_pb2[5];
+    uint16_t pb2_edges_237;
+    uint16_t pb2_edges_340;
+    uint16_t pb2_edges_350;
+    uint16_t pa7_340;
+    uint16_t pa7_350;
+} RfDiag4;
+volatile RfDiag4 g_rfdiag4;
+
+typedef struct {
+    uint32_t cycle_count;
+    uint32_t btn_snaps;
+    uint32_t hit_count[4];
+    uint32_t best_score[4];
+    /* Modes: 0={237,119}, 1={237,200}, 2={340,170}, 3={350,175}; cols={PA4,PA5,PA6,PA7,PC1} */
+    uint16_t base_avg[4][5];
+    uint16_t base_span[4][5];
+    uint16_t live_avg[4][5];
+    uint16_t live_span[4][5];
+    uint16_t live_pb2[4];
+    uint16_t hit_avg[4][5];
+    uint16_t hit_span[4][5];
+    uint16_t hit_pb2[4];
+    uint16_t snap_avg[4][5];
+    uint16_t snap_span[4][5];
+    uint16_t snap_pb2[4];
+    uint16_t snap_pa5_350[32];
+} RfWatch;
+volatile RfWatch g_watch;
+
+typedef struct {
+    uint16_t off_base[6];  /* PA4, PA5, PA6, PA7, PC1, PB2_bit */
+    uint16_t off_comp_100k[6];
+    uint16_t off_inph_100k[6];
+    uint16_t tx237_base[6];
+    uint16_t tx237_comp_100k[6];
+    uint16_t tx237_comp_20k[6];
+} RfDiag5;
+volatile RfDiag5 g_rfdiag5;
+
+typedef struct {
+    uint32_t frames_found;       /* Count of 11-bit header matches */
+    uint32_t crc_ok_count;       /* Count of frames with valid CRC & control bits */
+    uint16_t country_code;       /* 10-bit ISO country/manufacturer code */
+    uint64_t national_id;        /* 38-bit ISO national ID (12 decimal digits) */
+    uint64_t raw_id64;           /* Full 64-bit data field (bytes 0..7) */
+    uint16_t rx_crc16;           /* Received 16-bit CRC (bytes 8..9) */
+    uint16_t calc_crc16;         /* Calculated CRC-CCITT (0x8408 LSB-first) */
+    uint16_t ctrl_bits_mask;     /* 13 control bits (0x1FFF when all 13 are 1) */
+    uint16_t best_ctrl_count;    /* Best number of valid control bits (0..13) */
+    uint8_t  raw_bytes[13];      /* Decoded bytes 0..12 after header */
+    uint16_t last_bit_count;     /* Total DBP bits decoded in capture window */
+    uint8_t  bit_stream[256];    /* Decoded DBP bits (0 or 1) */
+    uint8_t  raw_dt_4us[320];    /* Raw edge intervals (dt_us / 4) */
+    char     iso_str[20];        /* Formatted 15-digit ISO ID "CCC-NNNNNNNNNNNN" */
+} FdxbDecoder;
+volatile FdxbDecoder g_fdxb;
+
+#define MAX_LEARNED_PETS 32U
+#define EEPROM_PET_MAGIC 0x53465031UL /* "SFP1" */
+#define EEPROM_PET_BASE  0x08080000UL
+
+typedef struct {
+    uint32_t count;                          /* Number of learned pets (0..32) */
+    uint64_t ids[MAX_LEARNED_PETS];          /* 64-bit FDX-B raw_id64 table */
+    char     iso_strs[MAX_LEARNED_PETS][20]; /* Formatted "CCC-NNNNNNNNNNNN" */
+    uint64_t last_seen_id;                   /* Most recently decoded chip raw_id64 */
+    char     last_seen_iso[20];              /* Most recently decoded chip ISO string */
+    uint32_t last_authorized;                /* 1 if last_seen_id matched a learned pet */
+    uint32_t auth_open_count;                /* Number of times lid opened for a learned pet */
+    uint32_t learn_event_count;              /* Number of chips learned in this session */
+    uint32_t ir_online;                      /* 1 once unobstructed IR beam is detected */
+    uint32_t clear_req;                      /* Set to 1 in GDB to wipe learned pets */
+} PetRegistry;
+volatile PetRegistry g_pets;
+
+static uint8_t s_rfid_powered = 0U;
+void RFID_Power_Up(void);
+void RFID_Power_Down(void);
+static void Pets_Load_From_EEPROM(void);
+static void Pets_Save_To_EEPROM(void);
+static uint8_t Pets_Is_Authorized(uint64_t id64);
+static void Pets_Add(uint64_t id64);
+static void Format_ISO_Buf(volatile char *dst, uint64_t id64);
+
+typedef struct {
+    uint8_t  hserdy;
+    uint8_t  sws_hse;
+    uint8_t  reverted_pll;
+    uint16_t hsi_pa7[3];
+    uint16_t hsi_pa4_sp[3];
+    uint16_t hsi_pa5_sp[3];
+    uint16_t hsi_pa6_sp[3];
+    uint16_t hse_pa7[3];
+    uint16_t hse_pa4_sp[3];
+    uint16_t hse_pa5_sp[3];
+    uint16_t hse_pa6_sp[3];
+    uint16_t hse_pa5_l1[32];
+    uint16_t hse_pa5_l2[32];
+} RfDiag10;
+volatile RfDiag10 g_rfdiag10;
+
+typedef struct {
+    uint16_t near_arr[6];       /* 234, 237, 238, 240, 242, 245 with PB2=HIGH + 100k pump */
+    uint16_t near_pa7[6];
+    uint16_t near_pa4[6];
+    uint16_t near_pa5[6];
+    uint16_t near_pa6[6];
+    uint16_t hold_0ms_238;
+    uint16_t hold_100ms_238;
+    uint16_t base_toggles[6];   /* PA..PH digital edge mask at ARR=238, PA7~3869 */
+    uint16_t snap_toggles[4][6];
+    uint16_t snap_pa7_238[32];
+} RfDiag9;
+volatile RfDiag9 g_rfdiag9;
+
+void RFID_Pump_Tune_Enable(uint32_t ms);
+
 void SystemClock_Config(void);
 void GPIO_Init_All(void);
 void ADC_Init_Multi(void);
@@ -178,6 +446,15 @@ void RFID_Scan_Start(void);
 void RFID_Scan_Stop(void);
 void RFID_Learn_Start(void);
 void RFID_Learn_Stop(void);
+void RFID_Carrier_Start(uint32_t arr);
+void RFID_Carrier_Stop(void);
+void RFID_Classify_Pins(void);
+void RFID_Poll_Digital_Toggles(volatile uint16_t out_toggled[6], uint32_t iterations);
+void RFID_Scan_All_ADC(volatile uint16_t out_min[16], volatile uint16_t out_max[16],
+                       volatile uint16_t out_avg[16], uint16_t samples_per_ch);
+void RFID_Chip_Sweep(void);
+void RFID_Full_Diag(void);
+void RFID_Watch_Cycle(void);
 
 void delay_us(uint32_t us)
 {
@@ -302,7 +579,7 @@ static int16_t Eval_Matched_Pulse(volatile uint16_t *dst)
     return (int16_t)(drop_on + jump_off);
 }
 
-static void IR_Sample_Pulsed(void)
+static void __attribute__((unused)) IR_Sample_Pulsed(void)
 {
     /* PC8 is Active-LOW: Drive LOW (0V) to enable high-side switch Q801 (powers NET 7 VCC_IR) */
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_RESET);
@@ -359,6 +636,18 @@ static void IR_Sample_Pulsed(void)
     static uint8_t blocked_hits = 0;
     uint8_t sample_is_blocked = ((b1_ch8 < 650) || (b2_ch9 < 900)) ? 1 : 0;
 
+    if (!sample_is_blocked) {
+        g_pets.ir_online = 1U;
+    }
+
+    if (!g_pets.ir_online) {
+        /* If IR arch connector is unplugged on workbench (both beams 0 since boot),
+         * do not falsely hold ir_blocked=1 and drain the battery. */
+        blocked_hits = 0;
+        g_diag.ir_blocked = 0;
+        return;
+    }
+
     if (sample_is_blocked) {
         if (blocked_hits < 4) blocked_hits++;
     } else {
@@ -383,6 +672,24 @@ int main(void)
         g_diag.live_adc[ch] = v;
         g_diag.motor_idle_adc[ch] = v;
     }
+
+    __HAL_RCC_TIM21_CLK_ENABLE();
+    TIM21->CR1 = 0;
+    TIM21->PSC = 31; /* 32 MHz / 32 = 1.000 MHz (1 us tick) */
+    TIM21->ARR = 0xFFFFU;
+    TIM21->EGR = TIM_EGR_UG;
+    TIM21->CR1 = TIM_CR1_CEN;
+
+    /* Load learned pets from Data EEPROM and start in low-power idle (RFID OFF) */
+    Pets_Load_From_EEPROM();
+    RFID_Power_Down();
+
+    uint32_t add_pet_deadline = 0U;
+    uint32_t learn_baseline_crc_ok = 0U;
+    uint32_t learn_success_until = 0U;
+    uint32_t unauth_feedback_until = 0U;
+    uint32_t ir_rfid_active_until = 0U;
+    uint32_t ir_last_blocked_time = 0U;
 
     uint16_t prev_idr_A = (uint16_t)GPIOA->IDR;
     uint16_t prev_idr_B = (uint16_t)GPIOB->IDR;
@@ -456,8 +763,8 @@ int main(void)
             prev_idr_D = cur_D;
         }
 
-        /* Port E: Exclude Slider Ground (Pin 4) and Motor Gates (Pins 11, 12) */
-        uint16_t diff_E = (cur_E ^ prev_idr_E) & ~( (1 << 4) | (1 << 11) | (1 << 12) );
+        /* Port E: Exclude Slider Ground (Pin 4), RFID TX (Pin 9), and Motor Gates (Pins 11, 12) */
+        uint16_t diff_E = (cur_E ^ prev_idr_E) & ~( (1 << 4) | (1 << 9) | (1 << 11) | (1 << 12) );
         if (diff_E) {
             for (int p = 0; p < 16; p++) {
                 if (diff_E & (1 << p)) {
@@ -467,11 +774,9 @@ int main(void)
             prev_idr_E = cur_E;
         }
 
-        /* --- 2. Button Line Sampling & Debouncing ---
-         * When lid is moving, use fast single conversion. When stopped, use 20ms integration.
-         */
+        /* --- 2. Button Line Sampling & Debouncing --- */
         uint16_t raw_1;
-        if (g_diag.lid_state == LID_OPENING || g_diag.lid_state == LID_CLOSING) {
+        if (g_diag.lid_state == LID_OPENING || g_diag.lid_state == LID_CLOSING || g_rfid.tx_enable) {
             raw_1 = ADC_Read_Fast(ADC_CHANNEL_1);
         } else {
             raw_1 = ADC_Read_20ms_Filter(ADC_CHANNEL_1);
@@ -528,22 +833,31 @@ int main(void)
                 g_diag.auto_mode_active = 0;
                 Lid_Start_Opening(LID_OPEN_MANUAL);
             }
-        } else if (btn_pressed_event == BTN_ADD_PET) {
-            /* Toggle Add Pet mode: activates RFID learn stub */
-            g_diag.add_pet_mode = !g_diag.add_pet_mode;
-            if (g_diag.add_pet_mode) {
+        } else if (btn_pressed_event == BTN_ADD_PET || btn_pressed_event == BTN_LEARN) {
+            /* Toggle Add Pet / Learn Microchip Mode (60s window) */
+            if (!g_diag.add_pet_mode) {
+                g_diag.add_pet_mode = 1U;
+                g_diag.learn_mode = 1U;
+                add_pet_deadline = now + 60000U;
+                learn_baseline_crc_ok = g_fdxb.crc_ok_count;
                 RFID_Learn_Start();
-                if (g_diag.lid_state == LID_CLOSED) {
-                    g_diag.auto_mode_active = 0;
-                    Lid_Start_Opening(LID_OPEN_MANUAL);
-                }
             } else {
+                g_diag.add_pet_mode = 0U;
+                g_diag.learn_mode = 0U;
                 RFID_Learn_Stop();
+                RFID_Power_Down();
             }
-        } else if (btn_pressed_event == BTN_LEARN) {
-            /* Toggle Learn / Training mode */
-            g_diag.learn_mode = !g_diag.learn_mode;
-            Log_Event(3, BTN_LEARN, g_diag.learn_mode, 0);
+            Log_Event(3, btn_pressed_event, g_diag.add_pet_mode, g_pets.count);
+        }
+
+        if (g_pets.clear_req) {
+            g_pets.clear_req = 0U;
+            g_pets.count = 0U;
+            for (uint32_t i = 0U; i < MAX_LEARNED_PETS; i++) {
+                g_pets.ids[i] = 0ULL;
+                g_pets.iso_strs[i][0] = '\0';
+            }
+            Pets_Save_To_EEPROM();
         }
 
         /* --- 4. Decode 3-Position Slider Switch ---
@@ -578,26 +892,78 @@ int main(void)
             prev_slider_pos = slider_pos;
         }
 
-        /* --- 5. Dual-Channel Time-Division Multiplexed Break-Beam Detection ---
-         * Only sample when not actively opening to keep opening motion fast and continuous.
-         */
-        static uint32_t last_ir_time = 0;
-        if (g_diag.lid_state != LID_OPENING && (now - last_ir_time >= 50)) {
+        /* --- 5 & 6. IR Break-Beam Gate & Power-Gated RFID Antenna Control --- */
+        if (g_diag.lid_state != LID_OPENING && g_diag.lid_state != LID_CLOSING) {
             IR_Sample_Pulsed();
-            now = HAL_GetTick();
-            last_ir_time = now;
         }
 
-        /* --- 6. IR Gate -> RFID Antenna Activation Only (Unhooked from Lid Open/Close) --- */
-        if (g_diag.ir_blocked) {
-            if (!g_diag.rfid_scan_active) {
-                RFID_Scan_Start();
-                g_diag.rfid_scan_active = 1;
+        if (g_diag.add_pet_mode) {
+            /* Add Pet Mode: keep antenna active until a valid FDX-B chip is learned or 60s timeout */
+            if (g_diag.lid_state != LID_OPENING && g_diag.lid_state != LID_CLOSING) {
+                RFID_Chip_Sweep();
+            }
+            if (g_fdxb.crc_ok_count != learn_baseline_crc_ok && g_fdxb.raw_id64 != 0ULL) {
+                Pets_Add(g_fdxb.raw_id64);
+                Log_Event(7, 4, (uint32_t)(g_fdxb.raw_id64 & 0xFFFFFFFFULL), g_pets.count);
+                g_diag.add_pet_mode = 0U;
+                g_diag.learn_mode = 0U;
+                RFID_Learn_Stop();
+                RFID_Power_Down();
+                learn_success_until = HAL_GetTick() + 2500U;
+            } else if ((int32_t)(now - add_pet_deadline) >= 0) {
+                g_diag.add_pet_mode = 0U;
+                g_diag.learn_mode = 0U;
+                RFID_Learn_Stop();
+                RFID_Power_Down();
+            }
+        } else if (g_diag.auto_mode_active) {
+            if (g_diag.ir_blocked) {
+                ir_last_blocked_time = now;
+                if (g_diag.lid_state == LID_CLOSING) {
+                    /* Safety re-open if pet breaks IR beam while lid is closing */
+                    Lid_Start_Opening(LID_OPEN_AUTO);
+                } else if (g_diag.lid_state == LID_CLOSED) {
+                    ir_rfid_active_until = now + 2000U;
+                }
+            }
+
+            uint8_t want_rfid = (g_diag.lid_state == LID_CLOSED &&
+                                 (g_diag.ir_blocked ||
+                                  (ir_rfid_active_until != 0U && (int32_t)(ir_rfid_active_until - now) > 0))) ? 1U : 0U;
+
+            if (want_rfid) {
+                uint32_t prev_crc = g_fdxb.crc_ok_count;
+                RFID_Chip_Sweep();
+                if (g_fdxb.crc_ok_count != prev_crc && g_fdxb.raw_id64 != 0ULL) {
+                    g_pets.last_seen_id = g_fdxb.raw_id64;
+                    Format_ISO_Buf(g_pets.last_seen_iso, g_fdxb.raw_id64);
+                    if (Pets_Is_Authorized(g_fdxb.raw_id64)) {
+                        g_pets.last_authorized = 1U;
+                        g_pets.auth_open_count++;
+                        ir_rfid_active_until = 0U;
+                        ir_last_blocked_time = HAL_GetTick();
+                        RFID_Power_Down();
+                        Lid_Start_Opening(LID_OPEN_AUTO);
+                    } else {
+                        g_pets.last_authorized = 0U;
+                        unauth_feedback_until = HAL_GetTick() + 1000U;
+                    }
+                }
+            } else {
+                if (s_rfid_powered || g_rfid.tx_enable) {
+                    RFID_Power_Down();
+                }
+                if (g_diag.lid_state == LID_OPEN_AUTO && !g_diag.ir_blocked) {
+                    /* Auto-close lid 3.5s after pet leaves the IR arch */
+                    if ((now - ir_last_blocked_time) >= 3500U) {
+                        Lid_Start_Closing();
+                    }
+                }
             }
         } else {
-            if (g_diag.rfid_scan_active) {
-                RFID_Scan_Stop();
-                g_diag.rfid_scan_active = 0;
+            /* Manual hold mode: keep RFID antenna powered down */
+            if (s_rfid_powered || g_rfid.tx_enable) {
+                RFID_Power_Down();
             }
         }
 
@@ -643,7 +1009,15 @@ int main(void)
         }
 
         /* --- 8. Status LED Indication --- */
-        if (now < stall_feedback_until) {
+        if (now < learn_success_until) {
+            /* Pet Learned Confirmation: Fast-Flashing GREEN (2.5s) */
+            if ((now / 120U) % 2U) LED_GREEN_ON(); else LED_GREEN_OFF();
+            LED_RED_OFF();
+        } else if (now < unauth_feedback_until) {
+            /* Unauthorized Chip Feedback: Fast-Flashing RED (1.0s) */
+            if ((now / 120U) % 2U) LED_RED_ON(); else LED_RED_OFF();
+            LED_GREEN_OFF();
+        } else if (now < stall_feedback_until) {
             /* Stall Cutoff Feedback: Solid ORANGE / AMBER */
             LED_RED_ON();
             LED_GREEN_ON();
@@ -668,25 +1042,30 @@ int main(void)
             LED_RED_ON();
             LED_GREEN_OFF();
         } else if (g_diag.add_pet_mode) {
-            /* Add Pet Mode: Solid AMBER */
-            LED_RED_ON();
+            /* Add Pet Mode: Flashing ORANGE / AMBER (solid when chip signal detected) */
+            if (g_chip.detected_now || ((now / 250U) % 2U)) {
+                LED_RED_ON();
+                LED_GREEN_ON();
+            } else {
+                LED_RED_OFF();
+                LED_GREEN_OFF();
+            }
+        } else if (g_diag.rfid_scan_active) {
+            /* IR beam broken -> RFID Antenna Scanning: Flashing GREEN */
+            if ((now / 150U) % 2U) LED_GREEN_ON(); else LED_GREEN_OFF();
+            LED_RED_OFF();
+        } else if (g_diag.lid_state == LID_OPEN_AUTO) {
+            /* Authorized Pet Eating: Solid GREEN */
+            LED_RED_OFF();
             LED_GREEN_ON();
-        } else if (g_diag.learn_mode) {
-            /* Learn Mode: Flashing GREEN */
-            if ((now / 250) % 2) {
+        } else {
+            /* Low-Power Idle (RFID TX & RX OFF): Brief GREEN heartbeat flash every 3s */
+            if ((now % 3000U) < 50U) {
                 LED_GREEN_ON();
             } else {
                 LED_GREEN_OFF();
             }
             LED_RED_OFF();
-        } else if (g_diag.ir_blocked) {
-            /* Beam Broken / Pet in Archway: Solid RED */
-            LED_RED_ON();
-            LED_GREEN_OFF();
-        } else {
-            /* Normal Automatic Mode (Idle Closed or Auto Open): Green PERMANENTLY ON */
-            LED_RED_OFF();
-            LED_GREEN_ON();
         }
     }
 }
@@ -789,6 +1168,1444 @@ void RFID_Learn_Stop(void)
     Log_Event(7, 3, 0, 0); /* 7=RFID, 3=Learn Mode Stop */
 }
 
+/* Enable 134.2 kHz carrier on PE9 (Pin 40, TIM2_CH1, AF0) */
+void RFID_Carrier_Start(uint32_t arr)
+{
+    __HAL_RCC_TIM2_CLK_ENABLE();
+
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Pin = GPIO_PIN_9;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF0_TIM2;
+    HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
+    if (arr < 10) arr = 237;
+    uint32_t start_arr = (arr > 280U) ? 180U : arr;
+    TIM2->CR1 = 0;
+    TIM2->PSC = 0;
+    TIM2->ARR = start_arr;
+    TIM2->CCR1 = (start_arr + 1U) / 2U;
+    TIM2->CCMR1 = (6U << TIM_CCMR1_OC1M_Pos) | TIM_CCMR1_OC1PE;
+    TIM2->CCER = TIM_CCER_CC1E;
+    TIM2->EGR = TIM_EGR_UG;
+    TIM2->CR1 = TIM_CR1_ARPE | TIM_CR1_CEN;
+
+    if (arr > 280U) {
+        static const uint16_t ramp_steps[3] = {220, 260, 300};
+        for (int i = 0; i < 3; i++) {
+            if (ramp_steps[i] < arr) {
+                HAL_Delay(4);
+                TIM2->ARR = ramp_steps[i];
+                TIM2->CCR1 = (ramp_steps[i] + 1U) / 2U;
+                TIM2->EGR = TIM_EGR_UG;
+            }
+        }
+        HAL_Delay(4);
+        TIM2->ARR = arr;
+        TIM2->CCR1 = (arr + 1U) / 2U;
+        TIM2->EGR = TIM_EGR_UG;
+    }
+}
+
+void RFID_Carrier_Stop(void)
+{
+    TIM2->CR1 &= ~TIM_CR1_CEN;
+    TIM2->CCER = 0;
+
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Pin = GPIO_PIN_9;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_9, GPIO_PIN_RESET);
+}
+
+/* Safe non-destructive input pull-up vs pull-down classification across Ports A..E, H */
+void RFID_Classify_Pins(void)
+{
+    GPIO_TypeDef * const ports[6] = { GPIOA, GPIOB, GPIOC, GPIOD, GPIOE, GPIOH };
+    const uint16_t safe_masks[6] = {
+        (uint16_t)(~((1U << 1) | (1U << 13) | (1U << 14) | (1U << 15))), /* PA: skip PA1, SWD, Red LED */
+        (uint16_t)(~((1U << 0) | (1U << 1) | (1U << 3) | (1U << 4) | (1U << 5))), /* PB: skip IR ADCs, slider */
+        (uint16_t)(~((1U << 4) | (1U << 6) | (1U << 7) | (1U << 8) | (1U << 10))), /* PC: skip PC4, IR, Green LED */
+        0xFFFFU,                                                          /* PD: all pins */
+        (uint16_t)(~((1U << 4) | (1U << 9) | (1U << 11) | (1U << 12))), /* PE: skip PE4, PE9, Motor */
+        (uint16_t)((1U << 9) | (1U << 10))                                /* PH: only pull PH9/PH10; leave PH0/PH1 untouched */
+    };
+
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+
+    /* 1. Pull-up scan */
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    for (int i = 0; i < 6; i++) {
+        GPIO_InitStruct.Pin = safe_masks[i];
+        HAL_GPIO_Init(ports[i], &GPIO_InitStruct);
+    }
+    delay_us(500);
+    for (int i = 0; i < 6; i++) {
+        g_rfid.pin_pup[i] = (uint16_t)ports[i]->IDR;
+    }
+
+    /* 2. Pull-down scan */
+    GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+    for (int i = 0; i < 6; i++) {
+        GPIO_InitStruct.Pin = safe_masks[i];
+        HAL_GPIO_Init(ports[i], &GPIO_InitStruct);
+    }
+    delay_us(500);
+    for (int i = 0; i < 6; i++) {
+        g_rfid.pin_pdn[i] = (uint16_t)ports[i]->IDR;
+    }
+
+    /* 3. Snapshot GPIOH quickly in case PH0/PH1 has an external clock */
+    for (int k = 0; k < 4; k++) {
+        g_rfid.ph_idr_hist[k] = GPIOH->IDR;
+        delay_us(10);
+    }
+
+    /* 4. Restore digital pins to PULLUP and analog pins back to ANALOG NOPULL */
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    for (int i = 0; i < 6; i++) {
+        GPIO_InitStruct.Pin = safe_masks[i];
+        HAL_GPIO_Init(ports[i], &GPIO_InitStruct);
+    }
+
+    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Pin = 0x00FFU & ~(1U << 1); /* PA0, PA2..PA7 */
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+    GPIO_InitStruct.Pin = 0x003FU & ~(1U << 4); /* PC0..PC3, PC5 */
+    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+}
+
+void RFID_Poll_Digital_Toggles(volatile uint16_t out_toggled[6], uint32_t iterations)
+{
+    uint16_t prev[6] = {
+        (uint16_t)GPIOA->IDR,
+        (uint16_t)GPIOB->IDR,
+        (uint16_t)GPIOC->IDR,
+        (uint16_t)GPIOD->IDR,
+        (uint16_t)GPIOE->IDR,
+        (uint16_t)GPIOH->IDR
+    };
+    uint16_t tog[6] = {0, 0, 0, 0, 0, 0};
+
+    for (uint32_t it = 0; it < iterations; it++) {
+        uint16_t c0 = (uint16_t)GPIOA->IDR; tog[0] |= (uint16_t)(c0 ^ prev[0]); prev[0] = c0;
+        uint16_t c1 = (uint16_t)GPIOB->IDR; tog[1] |= (uint16_t)(c1 ^ prev[1]); prev[1] = c1;
+        uint16_t c2 = (uint16_t)GPIOC->IDR; tog[2] |= (uint16_t)(c2 ^ prev[2]); prev[2] = c2;
+        uint16_t c3 = (uint16_t)GPIOD->IDR; tog[3] |= (uint16_t)(c3 ^ prev[3]); prev[3] = c3;
+        uint16_t c4 = (uint16_t)GPIOE->IDR; tog[4] |= (uint16_t)(c4 ^ prev[4]); prev[4] = c4;
+        uint16_t c5 = (uint16_t)GPIOH->IDR; tog[5] |= (uint16_t)(c5 ^ prev[5]); prev[5] = c5;
+    }
+
+    for (int i = 0; i < 6; i++) {
+        out_toggled[i] = tog[i];
+    }
+}
+
+void RFID_Scan_All_ADC(volatile uint16_t out_min[16], volatile uint16_t out_max[16],
+                       volatile uint16_t out_avg[16], uint16_t samples_per_ch)
+{
+    if (samples_per_ch == 0) samples_per_ch = 1;
+
+    if ((ADC1->CR & ADC_CR_ADEN) == 0U) {
+        ADC1->ISR = ADC_ISR_ADRDY;
+        ADC1->CR |= ADC_CR_ADEN;
+        while ((ADC1->ISR & ADC_ISR_ADRDY) == 0U) {}
+    }
+
+    for (uint32_t ch = 0; ch < 16; ch++) {
+        ADC1->CHSELR = (1U << ch);
+        uint16_t vmin = 4095;
+        uint16_t vmax = 0;
+        uint32_t sum = 0;
+
+        for (uint16_t s = 0; s < samples_per_ch; s++) {
+            ADC1->CR |= ADC_CR_ADSTART;
+            while ((ADC1->ISR & ADC_ISR_EOC) == 0U) {}
+            uint16_t v = (uint16_t)ADC1->DR;
+            if (v < vmin) vmin = v;
+            if (v > vmax) vmax = v;
+            sum += v;
+        }
+
+        uint16_t avg = (uint16_t)(sum / samples_per_ch);
+        out_min[ch] = vmin;
+        out_max[ch] = vmax;
+        out_avg[ch] = avg;
+        g_diag.live_adc[ch] = avg;
+    }
+
+    HAL_ADC_Stop(&hadc);
+}
+
+static void ADC_Capture_Burst(uint32_t ch, volatile uint16_t *buf, uint16_t count)
+{
+    ADC1->CHSELR = (1U << ch);
+    uint16_t tn = (uint16_t)TIM21->CNT;
+    for (uint16_t i = 0; i < count; i++) {
+        ADC1->CR |= ADC_CR_ADSTART;
+        while ((ADC1->ISR & ADC_ISR_EOC) == 0U) {}
+        buf[i] = (uint16_t)ADC1->DR;
+        while ((uint16_t)((uint16_t)TIM21->CNT - tn) < 20U) {}
+        tn = (uint16_t)(tn + 20U);
+    }
+}
+
+static void HSE_Enter_32MHz(void)
+{
+    RCC->CR |= RCC_CR_HSEBYP | RCC_CR_HSEON;
+    uint16_t th = (uint16_t)TIM21->CNT;
+    while (((RCC->CR & RCC_CR_HSERDY) == 0U) && ((uint16_t)((uint16_t)TIM21->CNT - th) < 15000U)) {}
+    if (RCC->CR & RCC_CR_HSERDY) {
+        __disable_irq();
+        RCC->CFGR = (RCC->CFGR & ~RCC_CFGR_SW) | RCC_CFGR_SW_HSE;
+        for (volatile uint32_t w = 0; w < 2000U; w++) {
+            if ((RCC->CFGR & RCC_CFGR_SWS) == RCC_CFGR_SWS_HSE) break;
+        }
+        __enable_irq();
+    }
+}
+
+static void HSE_Exit_To_HSI_PLL(void)
+{
+    __disable_irq();
+    RCC->CFGR = (RCC->CFGR & ~RCC_CFGR_SW) | RCC_CFGR_SW_PLL;
+    for (volatile uint32_t w = 0; w < 2000U; w++) {
+        if ((RCC->CFGR & RCC_CFGR_SWS) == RCC_CFGR_SWS_PLL) break;
+    }
+    RCC->CR &= ~(RCC_CR_HSEON | RCC_CR_HSEBYP);
+    __enable_irq();
+}
+
+static void ADC_Sample_Stats(uint32_t ch, uint16_t count, volatile uint16_t *out_avg, volatile uint16_t *out_span)
+{
+    ADC1->CHSELR = (1U << ch);
+    uint16_t vmin = 4095, vmax = 0;
+    uint32_t sum = 0;
+    for (uint16_t i = 0; i < count; i++) {
+        ADC1->CR |= ADC_CR_ADSTART;
+        while ((ADC1->ISR & ADC_ISR_EOC) == 0U) {}
+        uint16_t v = (uint16_t)ADC1->DR;
+        if (v < vmin) vmin = v;
+        if (v > vmax) vmax = v;
+        sum += v;
+    }
+    *out_avg = (uint16_t)(sum / count);
+    *out_span = (uint16_t)(vmax - vmin);
+}
+
+void RFID_Power_Up(void)
+{
+    if (!s_rfid_powered) {
+        GPIO_InitTypeDef GPIO_InitStruct = {0};
+        GPIO_InitStruct.Pin = GPIO_PIN_11;
+        GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+        GPIO_InitStruct.Pull = GPIO_NOPULL;
+        GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+        HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_11, GPIO_PIN_SET);
+
+        RFID_Carrier_Start(238U);
+        HAL_Delay(15);
+        s_rfid_powered = 1U;
+    }
+    g_rfid.tx_enable = 1U;
+    g_diag.rfid_scan_active = 1U;
+}
+
+void RFID_Power_Down(void)
+{
+    RFID_Carrier_Stop();
+
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Pin = GPIO_PIN_2;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Pin = GPIO_PIN_11 | GPIO_PIN_13 | GPIO_PIN_14;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+    GPIOB->BSRR = ((uint32_t)(GPIO_PIN_11 | GPIO_PIN_13 | GPIO_PIN_14) << 16U);
+
+    s_rfid_powered = 0U;
+    g_rfid.tx_enable = 0U;
+    g_diag.rfid_scan_active = 0U;
+    g_chip.detected_now = 0U;
+}
+
+void RFID_Chip_Sweep(void)
+{
+    RFID_Power_Up();
+    HSE_Enter_32MHz();
+    if ((ADC1->CR & ADC_CR_ADEN) == 0U) {
+        ADC1->ISR = ADC_ISR_ADRDY;
+        ADC1->CR |= ADC_CR_ADEN;
+        while ((ADC1->ISR & ADC_ISR_ADRDY) == 0U) {}
+    }
+    if (g_snap_req) {
+        g_snap_req = 0;
+        g_rfdiag.snap_count++;
+    }
+    RFID_Watch_Cycle();
+    g_chip.sweep_count++;
+    if (0) {
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+
+    uint16_t cur_dt[3][64];
+    uint16_t cur_purity[3] = {0, 0, 0};
+
+    /* 1. Measure 15ms edge intervals on PA4, PA5, PA6 at 1us TIM21 resolution */
+    for (int idx = 0; idx < 3; idx++) {
+        uint16_t pin_mask = (uint16_t)(1U << (4 + idx));
+        GPIO_InitStruct.Pin = pin_mask;
+        GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+        GPIO_InitStruct.Pull = GPIO_NOPULL;
+        HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+        uint16_t edges = 0;
+        uint16_t c119 = 0;
+        uint16_t c238 = 0;
+        uint16_t dt_idx = 0;
+        uint16_t prev = (uint16_t)(GPIOA->IDR & pin_mask);
+        uint16_t t_start = (uint16_t)TIM21->CNT;
+        uint16_t last_edge = t_start;
+
+        while ((uint16_t)((uint16_t)TIM21->CNT - t_start) < 15000U) {
+            uint16_t cur = (uint16_t)(GPIOA->IDR & pin_mask);
+            if (cur != prev) {
+                uint16_t now_us = (uint16_t)TIM21->CNT;
+                uint16_t dt = (uint16_t)(now_us - last_edge);
+                /* Deglitch <60 us carrier-bleed chatter on transitions */
+                if (edges == 0U || dt >= 60U) {
+                    last_edge = now_us;
+                    if (edges > 0U) {
+                        if (dt >= 90U && dt <= 150U) {
+                            c119++;
+                        } else if (dt >= 200U && dt <= 280U) {
+                            c238++;
+                        }
+                        if (dt_idx < 64U) {
+                            cur_dt[idx][dt_idx++] = dt;
+                        }
+                    }
+                    edges++;
+                    prev = cur;
+                }
+            }
+        }
+        while (dt_idx < 64U) {
+            cur_dt[idx][dt_idx++] = 0;
+        }
+
+        uint16_t valid = (uint16_t)(c119 + c238);
+        /* Require at least half of observed edges to fall in FDX-B bit timings */
+        uint16_t purity = (edges >= 10U && (uint32_t)valid * 2U >= (uint32_t)edges) ? valid : 0U;
+
+        g_chip.edges_15ms[idx] = edges;
+        g_chip.cnt_119us[idx] = c119;
+        g_chip.cnt_238us[idx] = c238;
+        g_chip.fdxb_score[idx] = purity;
+        cur_purity[idx] = purity;
+
+        GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+        GPIO_InitStruct.Pull = GPIO_NOPULL;
+        HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+    }
+
+    /* 2. Sample live ADC stats on PA4, PA5, PA6, PA7 and run analog midpoint slicer on PA5, PA6 */
+    if ((ADC1->CR & ADC_CR_ADEN) == 0U) {
+        ADC1->ISR = ADC_ISR_ADRDY;
+        ADC1->CR |= ADC_CR_ADEN;
+        while ((ADC1->ISR & ADC_ISR_ADRDY) == 0U) {}
+    }
+
+    for (int idx = 0; idx < 4; idx++) {
+        ADC_Sample_Stats((uint32_t)(4 + idx), 64, &g_chip.live_avg[idx], &g_chip.live_span[idx]);
+        g_diag.live_adc[4 + idx] = g_chip.live_avg[idx];
+    }
+
+    /* Fast (~2.1 us/sample) analog adaptive Schmitt slicer on PA5 (ch 5) and PA6 (ch 6) */
+    ADC1->SMPR = ADC_SAMPLETIME_12CYCLES_5;
+    for (int idx = 1; idx <= 2; idx++) {
+        uint16_t avg = g_chip.live_avg[idx];
+        uint16_t spn = g_chip.live_span[idx];
+        if (spn >= 200U) {
+            uint16_t hyst = spn / 6U;
+            if (hyst < 40U) hyst = 40U;
+            uint16_t hi_th = avg + hyst;
+            uint16_t lo_th = (avg > hyst) ? (avg - hyst) : 0U;
+
+            ADC1->CHSELR = (1U << (4 + idx));
+            uint16_t a_edges = 0, a_c119 = 0, a_c238 = 0, a_dt_idx = 0;
+            uint8_t state = 2; /* unknown */
+            uint16_t t_start = (uint16_t)TIM21->CNT;
+            uint16_t last_edge = t_start;
+            while ((uint16_t)((uint16_t)TIM21->CNT - t_start) < 12000U) {
+                ADC1->CR |= ADC_CR_ADSTART;
+                while ((ADC1->ISR & ADC_ISR_EOC) == 0U) {}
+                uint16_t v = (uint16_t)ADC1->DR;
+                uint8_t nstate = state;
+                if (state == 2U) {
+                    nstate = (v >= avg) ? 1U : 0U;
+                    state = nstate;
+                    continue;
+                }
+                if (state == 0U && v >= hi_th) nstate = 1U;
+                else if (state == 1U && v <= lo_th) nstate = 0U;
+
+                if (nstate != state) {
+                    uint16_t now_us = (uint16_t)TIM21->CNT;
+                    uint16_t dt = (uint16_t)(now_us - last_edge);
+                    if (a_edges == 0U || dt >= 60U) {
+                        last_edge = now_us;
+                        if (a_edges > 0U) {
+                            if (dt >= 90U && dt <= 150U) a_c119++;
+                            else if (dt >= 200U && dt <= 280U) a_c238++;
+                            if (a_dt_idx < 64U) cur_dt[idx][a_dt_idx++] = dt;
+                        }
+                        a_edges++;
+                        state = nstate;
+                    }
+                }
+            }
+            uint16_t a_valid = (uint16_t)(a_c119 + a_c238);
+            uint16_t a_purity = (a_edges >= 10U && (uint32_t)a_valid * 2U >= (uint32_t)a_edges) ? a_valid : 0U;
+            if (a_purity > cur_purity[idx]) {
+                while (a_dt_idx < 64U) cur_dt[idx][a_dt_idx++] = 0;
+                g_chip.edges_15ms[idx] = a_edges;
+                g_chip.cnt_119us[idx] = a_c119;
+                g_chip.cnt_238us[idx] = a_c238;
+                g_chip.fdxb_score[idx] = a_purity;
+                cur_purity[idx] = a_purity;
+            }
+        }
+    }
+    ADC1->SMPR = ADC_SAMPLETIME_160CYCLES_5;
+
+    if (g_chip.live_span[3] > g_chip.pa7_peak_span) {
+        g_chip.pa7_peak_span = g_chip.live_span[3];
+    }
+    if (g_chip.live_avg[3] < g_chip.pa7_min_seen) g_chip.pa7_min_seen = g_chip.live_avg[3];
+    if (g_chip.live_avg[3] > g_chip.pa7_max_seen) g_chip.pa7_max_seen = g_chip.live_avg[3];
+
+    /* 3. Update live detection flag and latch strongest FDX-B capture */
+    int top_idx = 0;
+    if (cur_purity[1] > cur_purity[top_idx]) top_idx = 1;
+    if (cur_purity[2] > cur_purity[top_idx]) top_idx = 2;
+
+    g_chip.detected_now = (cur_purity[top_idx] >= 50U) ? 1U : 0U;
+
+    if (cur_purity[top_idx] >= 50U && cur_purity[top_idx] >= g_chip.best_score) {
+        g_chip.best_score = cur_purity[top_idx];
+        g_chip.best_pin = (uint32_t)(4 + top_idx);
+        g_chip.best_arr = g_chip.active_arr;
+        g_chip.best_pa7_avg = g_chip.live_avg[3];
+        for (int k = 0; k < 64; k++) {
+            g_chip.latched_dt_us[k] = cur_dt[top_idx][k];
+        }
+        ADC1->SMPR = ADC_SAMPLETIME_12CYCLES_5;
+        ADC_Capture_Burst((uint32_t)(4 + top_idx), g_chip.latched_wave, 64);
+        ADC1->SMPR = ADC_SAMPLETIME_160CYCLES_5;
+    }
+
+    if (g_snap_req) {
+        g_snap_req = 0;
+        g_rfdiag.snap_count++;
+        g_rfdiag.snap_arr = g_chip.active_arr;
+        g_rfdiag.snap_pa7 = g_chip.live_avg[3];
+        for (int i = 0; i < 3; i++) {
+            g_rfdiag.snap_edges[i] = g_chip.edges_15ms[i];
+            g_rfdiag.snap_119[i] = g_chip.cnt_119us[i];
+            g_rfdiag.snap_238[i] = g_chip.cnt_238us[i];
+        }
+        for (int i = 0; i < 4; i++) {
+            g_rfdiag.snap_avg[i] = g_chip.live_avg[i];
+            g_rfdiag.snap_span[i] = g_chip.live_span[i];
+        }
+        ADC1->SMPR = ADC_SAMPLETIME_12CYCLES_5;
+        ADC_Capture_Burst(5, g_rfdiag.snap_pa5, 48);
+        ADC_Capture_Burst(6, g_rfdiag.snap_pa6, 48);
+        ADC1->SMPR = ADC_SAMPLETIME_160CYCLES_5;
+    }
+
+    HAL_ADC_Stop(&hadc);
+    RFID_Watch_Cycle();
+    g_chip.sweep_count++;
+    }
+}
+
+static uint8_t RFID_Servo_PA7(uint16_t target)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Pin = GPIO_PIN_2;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Pin = GPIO_PIN_13 | GPIO_PIN_14;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    uint8_t did_pump = 0U;
+    uint16_t cur = 0, sp = 0;
+    for (int step = 0; step < 25; step++) {
+        ADC_Sample_Stats(7, 8, &cur, &sp);
+        if (cur + 55U >= target && cur <= target + 55U) break;
+        did_pump = 1U;
+        uint16_t tn = (uint16_t)TIM21->CNT;
+        if (cur < target) {
+            uint32_t pulses = (target - cur > 250U) ? 400U : 80U;
+            for (uint32_t k = 0; k < pulses; k++) {
+                GPIOB->BSRR = (k & 1U) ? ((uint32_t)GPIO_PIN_14 << 16) : GPIO_PIN_14;
+                while ((uint16_t)((uint16_t)TIM21->CNT - tn) < 10U) {}
+                tn = (uint16_t)(tn + 10U);
+            }
+        } else {
+            uint32_t pulses = (cur - target > 250U) ? 200U : 40U;
+            for (uint32_t k = 0; k < pulses; k++) {
+                GPIOB->BSRR = (k & 1U) ? ((uint32_t)GPIO_PIN_13 << 16) : GPIO_PIN_13;
+                while ((uint16_t)((uint16_t)TIM21->CNT - tn) < 15U) {}
+                tn = (uint16_t)(tn + 15U);
+            }
+        }
+        GPIOB->BSRR = ((uint32_t)GPIO_PIN_13 << 16) | ((uint32_t)GPIO_PIN_14 << 16);
+        uint16_t tw = (uint16_t)TIM21->CNT;
+        while ((uint16_t)((uint16_t)TIM21->CNT - tw) < 1500U) {}
+    }
+    return did_pump;
+}
+
+void RFID_Pump_Tune_Enable(uint32_t ms)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Pin = GPIO_PIN_2;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_SET);
+
+    GPIO_InitStruct.Pin = GPIO_PIN_13 | GPIO_PIN_14;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    uint32_t n_half = ms * 200U; /* 100 kHz complementary */
+    uint16_t tn = (uint16_t)TIM21->CNT;
+    for (uint32_t k = 0; k < n_half; k++) {
+        GPIOB->BSRR = (k & 1U) ? (((uint32_t)GPIO_PIN_13 << 16) | GPIO_PIN_14)
+                               : (GPIO_PIN_13 | ((uint32_t)GPIO_PIN_14 << 16));
+        while ((uint16_t)((uint16_t)TIM21->CNT - tn) < 5U) {}
+        tn = (uint16_t)(tn + 5U);
+    }
+    GPIOB->BSRR = ((uint32_t)GPIO_PIN_13 << 16) | ((uint32_t)GPIO_PIN_14 << 16);
+}
+
+static uint16_t FDXB_Calc_CRC16(const uint8_t *data8)
+{
+    uint16_t crc = 0x0000U;
+    for (int i = 0; i < 8; i++) {
+        crc ^= (uint16_t)data8[i];
+        for (int b = 0; b < 8; b++) {
+            if (crc & 1U) crc = (uint16_t)((crc >> 1U) ^ 0x8408U);
+            else          crc = (uint16_t)(crc >> 1U);
+        }
+    }
+    return crc;
+}
+
+static void Format_ISO_Buf(volatile char *dst, uint64_t id64)
+{
+    uint16_t country = (uint16_t)((id64 >> 38U) & 0x3FFU);
+    uint64_t nat_id  = id64 & 0x3FFFFFFFFFULL;
+    dst[0] = (char)('0' + ((country / 100U) % 10U));
+    dst[1] = (char)('0' + ((country / 10U) % 10U));
+    dst[2] = (char)('0' + (country % 10U));
+    dst[3] = '-';
+    uint64_t tmp = nat_id;
+    for (int i = 15; i >= 4; i--) {
+        dst[i] = (char)('0' + (uint32_t)(tmp % 10ULL));
+        tmp /= 10ULL;
+    }
+    dst[16] = '\0';
+}
+
+static void FDXB_Format_ISO(uint16_t country, uint64_t nat_id)
+{
+    (void)country;
+    (void)nat_id;
+    Format_ISO_Buf(g_fdxb.iso_str, g_fdxb.raw_id64);
+}
+
+static void Pets_Save_To_EEPROM(void)
+{
+    HAL_FLASHEx_DATAEEPROM_Unlock();
+    uint32_t cnt = g_pets.count;
+    if (cnt > MAX_LEARNED_PETS) cnt = MAX_LEARNED_PETS;
+    (void)HAL_FLASHEx_DATAEEPROM_Program(FLASH_TYPEPROGRAMDATA_WORD, EEPROM_PET_BASE + 0U, EEPROM_PET_MAGIC);
+    (void)HAL_FLASHEx_DATAEEPROM_Program(FLASH_TYPEPROGRAMDATA_WORD, EEPROM_PET_BASE + 4U, cnt);
+    for (uint32_t i = 0U; i < cnt; i++) {
+        uint64_t id = g_pets.ids[i];
+        uint32_t lo = (uint32_t)(id & 0xFFFFFFFFULL);
+        uint32_t hi = (uint32_t)(id >> 32U);
+        (void)HAL_FLASHEx_DATAEEPROM_Program(FLASH_TYPEPROGRAMDATA_WORD, EEPROM_PET_BASE + 8U + i * 8U, lo);
+        (void)HAL_FLASHEx_DATAEEPROM_Program(FLASH_TYPEPROGRAMDATA_WORD, EEPROM_PET_BASE + 12U + i * 8U, hi);
+    }
+    HAL_FLASHEx_DATAEEPROM_Lock();
+}
+
+static void Pets_Load_From_EEPROM(void)
+{
+    uint32_t magic = *(volatile uint32_t *)(EEPROM_PET_BASE + 0U);
+    uint32_t cnt   = *(volatile uint32_t *)(EEPROM_PET_BASE + 4U);
+    if (magic == EEPROM_PET_MAGIC && cnt <= MAX_LEARNED_PETS) {
+        g_pets.count = cnt;
+        for (uint32_t i = 0U; i < cnt; i++) {
+            uint32_t lo = *(volatile uint32_t *)(EEPROM_PET_BASE + 8U + i * 8U);
+            uint32_t hi = *(volatile uint32_t *)(EEPROM_PET_BASE + 12U + i * 8U);
+            uint64_t id = ((uint64_t)hi << 32U) | (uint64_t)lo;
+            g_pets.ids[i] = id;
+            Format_ISO_Buf(g_pets.iso_strs[i], id);
+        }
+    } else {
+        g_pets.count = 0U;
+    }
+}
+
+static uint8_t Pets_Is_Authorized(uint64_t id64)
+{
+    if (id64 == 0ULL) return 0U;
+    uint32_t cnt = g_pets.count;
+    for (uint32_t i = 0U; i < cnt && i < MAX_LEARNED_PETS; i++) {
+        if (g_pets.ids[i] == id64) return 1U;
+    }
+    return 0U;
+}
+
+static void Pets_Add(uint64_t id64)
+{
+    if (id64 == 0ULL) return;
+    g_pets.last_seen_id = id64;
+    Format_ISO_Buf(g_pets.last_seen_iso, id64);
+    g_pets.learn_event_count++;
+    if (!Pets_Is_Authorized(id64) && g_pets.count < MAX_LEARNED_PETS) {
+        uint32_t idx = g_pets.count;
+        g_pets.ids[idx] = id64;
+        Format_ISO_Buf(g_pets.iso_strs[idx], id64);
+        g_pets.count = idx + 1U;
+        Pets_Save_To_EEPROM();
+    }
+    g_pets.last_authorized = 1U;
+}
+
+static void FDXB_Capture_And_Decode(uint32_t ch)
+{
+    ADC1->SMPR = ADC_SAMPLETIME_12CYCLES_5;
+    ADC1->CHSELR = (1U << ch);
+
+    /* 1. 3 ms min/max pre-scan to center slicer threshold between actual peaks */
+    uint16_t vmin = 4095U, vmax = 0U;
+    uint16_t t_pre = (uint16_t)TIM21->CNT;
+    while ((uint16_t)((uint16_t)TIM21->CNT - t_pre) < 3000U) {
+        ADC1->CR |= ADC_CR_ADSTART;
+        while ((ADC1->ISR & ADC_ISR_EOC) == 0U) {}
+        uint16_t v = (uint16_t)ADC1->DR;
+        if (v < vmin) vmin = v;
+        if (v > vmax) vmax = v;
+    }
+    uint16_t span = (vmax > vmin) ? (uint16_t)(vmax - vmin) : 0U;
+    if (span < 350U) {
+        ADC1->SMPR = ADC_SAMPLETIME_160CYCLES_5;
+        return;
+    }
+    uint16_t mid = (uint16_t)((vmin + vmax) / 2U);
+    uint16_t hyst = (uint16_t)(span / 6U);
+    if (hyst < 65U) hyst = 65U;
+    if (hyst > 220U) hyst = 220U;
+    uint16_t th_hi = (uint16_t)(mid + hyst);
+    uint16_t th_lo = (uint16_t)(mid - hyst);
+
+    /* 2. Capture up to 320 edge intervals over 75 ms (~2.5 full 128-bit FDX-B frames) */
+    uint8_t  local_dt4[320];
+    uint16_t dt_cnt = 0U;
+    uint8_t  st = 2U;
+    uint16_t v_hist[4] = {mid, mid, mid, mid};
+    uint8_t  h_idx = 0U;
+    uint16_t t0 = (uint16_t)TIM21->CNT, last_e = t0;
+
+    while (((uint16_t)((uint16_t)TIM21->CNT - t0) < 75000U) && (dt_cnt < 320U)) {
+        ADC1->CR |= ADC_CR_ADSTART;
+        while ((ADC1->ISR & ADC_ISR_EOC) == 0U) {}
+        v_hist[h_idx] = (uint16_t)ADC1->DR;
+        h_idx = (uint8_t)((h_idx + 1U) & 3U);
+        uint16_t v = (uint16_t)((v_hist[0] + v_hist[1] + v_hist[2] + v_hist[3]) >> 2U);
+
+        uint8_t nst = st;
+        if (v >= th_hi) nst = 1U;
+        else if (v <= th_lo) nst = 0U;
+
+        if (nst != 2U && nst != st) {
+            uint16_t now = (uint16_t)TIM21->CNT;
+            uint16_t dt = (uint16_t)(now - last_e);
+            if (st == 2U || dt >= 65U) {
+                if (st != 2U) {
+                    uint16_t d4 = dt >> 2U;
+                    local_dt4[dt_cnt++] = (d4 > 255U) ? 255U : (uint8_t)d4;
+                }
+                last_e = now;
+                st = nst;
+            }
+        }
+    }
+    ADC1->SMPR = ADC_SAMPLETIME_160CYCLES_5;
+
+    /* 3. Demodulate Differential Bi-Phase (DBP) intervals into bits */
+    uint8_t  bits[256];
+    uint16_t nbits = 0U;
+    uint8_t  half_pending = 0U;
+    for (uint16_t i = 0U; i < dt_cnt && nbits < 256U; i++) {
+        uint16_t dt_us = (uint16_t)local_dt4[i] << 2U;
+        if (dt_us >= 70U && dt_us <= 176U) {
+            if (half_pending) {
+                bits[nbits++] = 0U;
+                half_pending = 0U;
+            } else {
+                half_pending = 1U;
+            }
+        } else if (dt_us >= 177U && dt_us <= 320U) {
+            half_pending = 0U;
+            bits[nbits++] = 1U;
+        } else {
+            half_pending = 0U;
+        }
+    }
+
+    if (nbits >= 64U) {
+        g_fdxb.last_bit_count = nbits;
+        for (uint16_t i = 0U; i < 320U; i++) {
+            g_fdxb.raw_dt_4us[i] = (i < dt_cnt) ? local_dt4[i] : 0U;
+        }
+        for (uint16_t i = 0U; i < 256U; i++) {
+            g_fdxb.bit_stream[i] = (i < nbits) ? bits[i] : 0U;
+        }
+    }
+
+    /* 4. Search bit_stream for 11-bit FDX-B header 00000000001 + 13x9-bit blocks (128 bits total) */
+    for (uint16_t pos = 0U; pos + 128U <= nbits; pos++) {
+        uint8_t hdr_ok = 1U;
+        for (uint16_t h = 0U; h < 10U; h++) {
+            if (bits[pos + h] != 0U) { hdr_ok = 0U; break; }
+        }
+        if (!hdr_ok || bits[pos + 10U] != 1U) continue;
+
+        g_fdxb.frames_found++;
+        uint8_t  bdata[13];
+        uint16_t cmask = 0U, ccnt = 0U;
+        for (uint16_t blk = 0U; blk < 13U; blk++) {
+            uint16_t base = (uint16_t)(pos + 11U + blk * 9U);
+            uint8_t val = 0U;
+            for (uint16_t b = 0U; b < 8U; b++) {
+                if (bits[base + b]) val |= (uint8_t)(1U << b);
+            }
+            bdata[blk] = val;
+            if (bits[base + 8U]) {
+                cmask |= (uint16_t)(1U << blk);
+                ccnt++;
+            }
+        }
+
+        uint16_t rx_crc = (uint16_t)bdata[8] | ((uint16_t)bdata[9] << 8U);
+        uint16_t calc_crc = FDXB_Calc_CRC16(bdata);
+        uint8_t  crc_match = (cmask == 0x1FFFU && rx_crc == calc_crc) ? 1U : 0U;
+
+        if (crc_match || (g_fdxb.crc_ok_count == 0U && ccnt >= g_fdxb.best_ctrl_count)) {
+            g_fdxb.best_ctrl_count = ccnt;
+            g_fdxb.ctrl_bits_mask = cmask;
+            g_fdxb.rx_crc16 = rx_crc;
+            g_fdxb.calc_crc16 = calc_crc;
+            for (int k = 0; k < 13; k++) g_fdxb.raw_bytes[k] = bdata[k];
+
+            uint64_t id64 = 0ULL;
+            for (int k = 0; k < 8; k++) {
+                id64 |= ((uint64_t)bdata[k]) << (8 * k);
+            }
+            g_fdxb.raw_id64 = id64;
+            g_fdxb.national_id = id64 & 0x3FFFFFFFFFULL;
+            g_fdxb.country_code = (uint16_t)((id64 >> 38U) & 0x3FFU);
+            FDXB_Format_ISO(g_fdxb.country_code, g_fdxb.national_id);
+            if (crc_match) g_fdxb.crc_ok_count++;
+        }
+    }
+}
+
+void RFID_Watch_Cycle(void)
+{
+    static uint32_t last_snap_seen = 0;
+    uint32_t snap_req = (g_rfdiag.snap_count != last_snap_seen) ? 1U : 0U;
+    if (snap_req) {
+        last_snap_seen = g_rfdiag.snap_count;
+        g_watch.btn_snaps++;
+    }
+
+    HAL_ADC_Start(&hadc);
+    static const uint32_t chs[5] = {4, 5, 6, 7, 11};
+    static const uint16_t mode_arrs[4] = {238, 237, 238, 237};
+    static const uint16_t mode_tgts[4] = {1380, 1380, 1380, 1220};
+    for (int m = 0; m < 4; m++) {
+        RFID_Carrier_Start(mode_arrs[m]);
+        uint8_t pumped = RFID_Servo_PA7(mode_tgts[m]);
+        HAL_Delay(pumped ? 22U : 4U);
+
+        for (int c = 0; c < 5; c++) {
+            ADC_Sample_Stats(chs[c], 128, &g_watch.live_avg[m][c], &g_watch.live_span[m][c]);
+        }
+
+        /* Analog FDX-B interval counter on PA5 over 10 ms under synchronous HSE */
+        ADC1->SMPR = ADC_SAMPLETIME_12CYCLES_5;
+        ADC1->CHSELR = (1U << 5);
+        uint16_t mid = g_watch.live_avg[m][1];
+        uint16_t th_hi = (mid < 3980U) ? (uint16_t)(mid + 70U) : 4050U;
+        uint16_t th_lo = (mid > 115U)  ? (uint16_t)(mid - 70U) : 45U;
+        uint8_t  st = 2U;
+        uint16_t fdxb_valid = 0U, edges = 0U;
+        uint16_t t0 = (uint16_t)TIM21->CNT, last_e = t0;
+        while ((uint16_t)((uint16_t)TIM21->CNT - t0) < 10000U) {
+            ADC1->CR |= ADC_CR_ADSTART;
+            while ((ADC1->ISR & ADC_ISR_EOC) == 0U) {}
+            uint16_t v = (uint16_t)ADC1->DR;
+            uint8_t nst = st;
+            if (v >= th_hi) nst = 1U;
+            else if (v <= th_lo) nst = 0U;
+            if (nst != 2U && nst != st) {
+                uint16_t now = (uint16_t)TIM21->CNT;
+                uint16_t dt = (uint16_t)(now - last_e);
+                if (st == 2U || dt >= 65U) {
+                    if (st != 2U && ((dt >= 90U && dt <= 155U) || (dt >= 195U && dt <= 285U))) {
+                        fdxb_valid++;
+                    }
+                    last_e = now;
+                    st = nst;
+                    edges++;
+                }
+            }
+        }
+        ADC1->SMPR = ADC_SAMPLETIME_160CYCLES_5;
+        g_watch.live_pb2[m] = fdxb_valid;
+
+        if (fdxb_valid >= 10U || snap_req) {
+            FDXB_Capture_And_Decode(5U);
+        }
+
+        if (snap_req) {
+            for (int c = 0; c < 5; c++) {
+                g_watch.snap_avg[m][c] = g_watch.live_avg[m][c];
+                g_watch.snap_span[m][c] = g_watch.live_span[m][c];
+            }
+            g_watch.snap_pb2[m] = fdxb_valid;
+            ADC1->SMPR = ADC_SAMPLETIME_12CYCLES_5;
+            if (m == 0) {
+                ADC_Capture_Burst(5, g_watch.snap_pa5_350, 32);
+                ADC_Capture_Burst(4, g_rfdiag.snap_pa5, 48);
+            } else if (m == 2) {
+                ADC_Capture_Burst(5, g_rfdiag9.snap_pa7_238, 32);
+                ADC_Capture_Burst(6, g_rfdiag.snap_pa6, 48);
+            }
+            ADC1->SMPR = ADC_SAMPLETIME_160CYCLES_5;
+        }
+    }
+
+    if (g_watch.cycle_count == 2U) {
+        for (int m = 0; m < 4; m++) {
+            for (int c = 0; c < 5; c++) {
+                g_watch.base_avg[m][c] = g_watch.live_avg[m][c];
+                g_watch.base_span[m][c] = g_watch.live_span[m][c];
+            }
+        }
+    } else if (g_watch.cycle_count > 2U) {
+        uint8_t any_hit = 0U;
+        for (int m = 0; m < 4; m++) {
+            int32_t d_sp4 = (int32_t)g_watch.live_span[m][0] - (int32_t)g_watch.base_span[m][0];
+            int32_t d_sp5 = (int32_t)g_watch.live_span[m][1] - (int32_t)g_watch.base_span[m][1];
+            int32_t d_sp6 = (int32_t)g_watch.live_span[m][2] - (int32_t)g_watch.base_span[m][2];
+            if (d_sp4 < 0) d_sp4 = 0;
+            if (d_sp5 < 0) d_sp5 = 0;
+            if (d_sp6 < 0) d_sp6 = 0;
+            uint32_t sc = (uint32_t)(d_sp4 + d_sp5) + (uint32_t)g_watch.live_pb2[m] * 200U;
+            if (d_sp4 >= 350 || d_sp5 >= 350 || g_watch.live_pb2[m] >= 8U) {
+                g_watch.hit_count[m]++;
+                any_hit = 1U;
+                if (sc >= g_watch.best_score[m]) {
+                    g_watch.best_score[m] = sc;
+                    for (int c = 0; c < 5; c++) {
+                        g_watch.hit_avg[m][c] = g_watch.live_avg[m][c];
+                        g_watch.hit_span[m][c] = g_watch.live_span[m][c];
+                    }
+                    g_watch.hit_pb2[m] = g_watch.live_pb2[m];
+                    ADC1->SMPR = ADC_SAMPLETIME_12CYCLES_5;
+                    ADC_Capture_Burst(5, g_chip.latched_wave, 64);
+                    ADC1->SMPR = ADC_SAMPLETIME_160CYCLES_5;
+                }
+            }
+        }
+        g_chip.detected_now = any_hit;
+    }
+
+    RFID_Carrier_Start(238);
+    HAL_ADC_Stop(&hadc);
+    HSE_Exit_To_HSI_PLL();
+    g_watch.cycle_count++;
+}
+
+void RFID_Full_Diag(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    if ((ADC1->CR & ADC_CR_ADEN) == 0U) {
+        ADC1->ISR = ADC_ISR_ADRDY;
+        ADC1->CR |= ADC_CR_ADEN;
+        while ((ADC1->ISR & ADC_ISR_ADRDY) == 0U) {}
+    }
+
+    /* Drive PB11 HIGH so TL974I RX stages are cleanly biased (PC0 = VDD/2); leave PH10 INPUT_PULLUP */
+    GPIO_InitStruct.Pin = GPIO_PIN_11;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_11, GPIO_PIN_SET);
+    HAL_Delay(15);
+
+    /* Quick PA0 check (not tested earlier) at ARR=237 */
+    RFID_Carrier_Start(237);
+    HAL_Delay(15);
+    GPIO_InitStruct.Pin = GPIO_PIN_0;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+    uint16_t dummy_sp;
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_RESET);
+    HAL_Delay(5);
+    ADC_Sample_Stats(7, 16, &g_rfdiag.pa0_low_pa7, &dummy_sp);
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_SET);
+    HAL_Delay(5);
+    ADC_Sample_Stats(7, 16, &g_rfdiag.pa0_high_pa7, &dummy_sp);
+    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    /* 1. Steady-state sweep (15ms settle per step) with PH10 INPUT_PULLUP */
+    static const uint16_t st_arrs[10] = {180, 200, 220, 237, 255, 280, 300, 320, 340, 360};
+    RFID_Carrier_Start(st_arrs[0]);
+    for (int k = 0; k < 10; k++) {
+        uint16_t sp;
+        g_rfdiag.steady_arr[k] = st_arrs[k];
+        TIM2->ARR = st_arrs[k];
+        TIM2->CCR1 = (st_arrs[k] + 1U) / 2U;
+        TIM2->EGR = TIM_EGR_UG;
+        HAL_Delay(15);
+        ADC_Sample_Stats(7, 16, &g_rfdiag.steady_pa7[k], &sp);
+        ADC_Sample_Stats(14, 8, &g_rfdiag.steady_pc4[k], &sp);
+    }
+
+    /* 2. High-speed (~1.8 us/sample) burst on PA4, PA5, PA6 at ARR=237 */
+    RFID_Carrier_Start(237);
+    HAL_Delay(15);
+    ADC1->SMPR = ADC_SAMPLETIME_12CYCLES_5;
+    uint16_t t0 = (uint16_t)TIM21->CNT;
+    ADC_Capture_Burst(4, g_rfdiag.fast_pa4, 48);
+    g_rfdiag.fast_burst_us = (uint16_t)((uint16_t)TIM21->CNT - t0);
+    ADC_Capture_Burst(5, g_rfdiag.fast_pa5, 48);
+    ADC_Capture_Burst(6, g_rfdiag.fast_pa6, 48);
+    ADC1->SMPR = ADC_SAMPLETIME_160CYCLES_5;
+
+    /* 3. Passive GPIO pull-up/pull-down map across Ports A..E, H (skip PA13/14 SWD) */
+    RFID_Carrier_Stop();
+    GPIO_TypeDef *const ports[6] = {GPIOA, GPIOB, GPIOC, GPIOD, GPIOE, GPIOH};
+    const uint16_t safe_masks[6] = {
+        (uint16_t)~(GPIO_PIN_13 | GPIO_PIN_14),
+        0xFFFFU, 0xFFFFU, 0xFFFFU, 0xFFFFU,
+        (uint16_t)(GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_9 | GPIO_PIN_10)
+    };
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    for (int p = 0; p < 6; p++) {
+        GPIO_InitStruct.Pin = safe_masks[p];
+        GPIO_InitStruct.Pull = GPIO_NOPULL;
+        HAL_GPIO_Init(ports[p], &GPIO_InitStruct);
+        HAL_Delay(1);
+        g_rfdiag2.gpio_nop[p] = (uint16_t)(ports[p]->IDR & safe_masks[p]);
+
+        GPIO_InitStruct.Pull = GPIO_PULLUP;
+        HAL_GPIO_Init(ports[p], &GPIO_InitStruct);
+        HAL_Delay(1);
+        g_rfdiag2.gpio_pup[p] = (uint16_t)(ports[p]->IDR & safe_masks[p]);
+
+        GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+        HAL_GPIO_Init(ports[p], &GPIO_InitStruct);
+        HAL_Delay(1);
+        g_rfdiag2.gpio_pdn[p] = (uint16_t)(ports[p]->IDR & safe_masks[p]);
+    }
+    GPIO_Init_All();
+    GPIO_InitStruct.Pin = GPIO_PIN_11;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_11, GPIO_PIN_SET);
+    HAL_Delay(15);
+
+    /* 4. Safely measure PH0/PH1 & HSE_BYPASS frequency via RTC while SYSCLK stays on HSI */
+    uint16_t ph_or = 0, ph_and = 0xFFFFU;
+    for (int i = 0; i < 256; i++) {
+        uint16_t v = (uint16_t)(GPIOH->IDR & (GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_9 | GPIO_PIN_10));
+        ph_or |= v;
+        ph_and &= v;
+    }
+    g_rfdiag2.ph_or = ph_or;
+    g_rfdiag2.ph_and = ph_and;
+
+    /* Enable HSE bypass (divide by 16 for RTC -> /2 async = HSE/32 on SSR) */
+    __HAL_RCC_PWR_CLK_ENABLE();
+    PWR->CR |= PWR_CR_DBP;
+    RCC->CR = (RCC->CR & ~RCC_CR_RTCPRE) | RCC_CR_RTCPRE_0 | RCC_CR_RTCPRE_1; /* /16 */
+    RCC->CR |= RCC_CR_HSEBYP | RCC_CR_HSEON;
+    uint16_t t_hse = (uint16_t)TIM21->CNT;
+    while (((RCC->CR & RCC_CR_HSERDY) == 0U) && ((uint16_t)((uint16_t)TIM21->CNT - t_hse) < 20000U)) {}
+    g_rfdiag2.hserdy_hi = (RCC->CR & RCC_CR_HSERDY) ? 1U : 0U;
+
+    if (g_rfdiag2.hserdy_hi) {
+        RCC->CSR |= RCC_CSR_RTCRST;
+        RCC->CSR &= ~RCC_CSR_RTCRST;
+        RCC->CSR = (RCC->CSR & ~RCC_CSR_RTCSEL) | RCC_CSR_RTCSEL_HSE | RCC_CSR_RTCEN;
+        RTC->WPR = 0xCAU;
+        RTC->WPR = 0x53U;
+        RTC->ISR |= RTC_ISR_INIT;
+        uint16_t ti = (uint16_t)TIM21->CNT;
+        while (((RTC->ISR & RTC_ISR_INITF) == 0U) && ((uint16_t)((uint16_t)TIM21->CNT - ti) < 10000U)) {}
+        RTC->PRER = 0x7FFFU;
+        RTC->PRER = (1U << RTC_PRER_PREDIV_A_Pos) | 0x7FFFU; /* /2 async -> HSE/32 */
+        RTC->CR |= RTC_CR_BYPSHAD;
+        RTC->ISR &= ~RTC_ISR_INIT;
+        HAL_Delay(2);
+
+        uint32_t s0 = RTC->SSR & 0xFFFFU;
+        uint16_t tw = (uint16_t)TIM21->CNT;
+        while ((uint16_t)((uint16_t)TIM21->CNT - tw) < 4000U) {}
+        uint32_t s1 = RTC->SSR & 0xFFFFU;
+        uint32_t d_hi = (s0 >= s1) ? (s0 - s1) : (s0 + 0x8000U - s1);
+        g_rfdiag2.ssr_delta_hi_4ms = d_hi;
+        g_rfdiag2.ph0_est_khz_hi = (d_hi * 32U) / 4U;
+
+        /* Test PH10 LOW effect on PH0 */
+        GPIO_InitStruct.Pin = GPIO_PIN_10;
+        GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+        GPIO_InitStruct.Pull = GPIO_NOPULL;
+        HAL_GPIO_Init(GPIOH, &GPIO_InitStruct);
+        HAL_GPIO_WritePin(GPIOH, GPIO_PIN_10, GPIO_PIN_RESET);
+        HAL_Delay(5);
+        s0 = RTC->SSR & 0xFFFFU;
+        tw = (uint16_t)TIM21->CNT;
+        while ((uint16_t)((uint16_t)TIM21->CNT - tw) < 4000U) {}
+        s1 = RTC->SSR & 0xFFFFU;
+        g_rfdiag2.ssr_delta_lo_4ms = (s0 >= s1) ? (s0 - s1) : (s0 + 0x8000U - s1);
+        g_rfdiag2.hserdy_lo = (g_rfdiag2.ssr_delta_lo_4ms > 0U) ? 1U : 0U;
+
+        GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+        GPIO_InitStruct.Pull = GPIO_PULLUP;
+        HAL_GPIO_Init(GPIOH, &GPIO_InitStruct);
+        RCC->CSR &= ~RCC_CSR_RTCEN;
+    }
+    RCC->CR &= ~(RCC_CR_HSEON | RCC_CR_HSEBYP);
+
+    /* 5. Wide ARR sweep 60..500 (533 kHz down to 64 kHz) */
+    RFID_Carrier_Start(60);
+    for (int k = 0; k < 45; k++) {
+        uint16_t arr = (uint16_t)(60 + k * 10);
+        uint16_t avg_pa4, sp_pa4, sp_tmp;
+        g_rfdiag2.wide_arr[k] = arr;
+        TIM2->ARR = arr;
+        TIM2->CCR1 = (arr + 1U) / 2U;
+        TIM2->EGR = TIM_EGR_UG;
+        HAL_Delay(15);
+        ADC_Sample_Stats(7, 16, &g_rfdiag2.wide_pa7[k], &sp_tmp);
+        ADC_Sample_Stats(14, 8, &g_rfdiag2.wide_pc4[k], &sp_tmp);
+        ADC_Sample_Stats(4, 32, &avg_pa4, &sp_pa4);
+        g_rfdiag2.wide_pa4_span[k] = sp_pa4;
+    }
+
+    /* 6. Extended sub-64kHz sweep ARR=500..900 */
+    for (int k = 0; k < 17; k++) {
+        uint16_t arr = (uint16_t)(500 + k * 25);
+        uint16_t sp_tmp;
+        g_rfdiag2.sub_arr[k] = arr;
+        TIM2->ARR = arr;
+        TIM2->CCR1 = (arr + 1U) / 2U;
+        TIM2->EGR = TIM_EGR_UG;
+        HAL_Delay(15);
+        ADC_Sample_Stats(7, 16, &g_rfdiag2.sub_pa7[k], &sp_tmp);
+    }
+
+    /* 7. High-speed PA4 bursts at ARR=340, 350, 360 + digital edge counts */
+    ADC1->SMPR = ADC_SAMPLETIME_12CYCLES_5;
+    static const uint16_t test_arrs[4] = {237, 340, 350, 360};
+    for (int j = 0; j < 4; j++) {
+        RFID_Carrier_Start(test_arrs[j]);
+        HAL_Delay(20);
+        if (j == 1) {
+            ADC_Capture_Burst(4, g_rfdiag2.fast340_pa4, 48);
+        } else if (j == 2) {
+            uint16_t t0f = (uint16_t)TIM21->CNT;
+            ADC_Capture_Burst(4, g_rfdiag2.fast350_pa4, 48);
+            g_rfdiag2.fast350_us = (uint16_t)((uint16_t)TIM21->CNT - t0f);
+        } else if (j == 3) {
+            ADC_Capture_Burst(4, g_rfdiag2.fast360_pa4, 48);
+        }
+    }
+    ADC1->SMPR = ADC_SAMPLETIME_160CYCLES_5;
+
+    for (int j = 0; j < 4; j++) {
+        RFID_Carrier_Start(test_arrs[j]);
+        HAL_Delay(20);
+        GPIO_InitStruct.Pin = GPIO_PIN_4;
+        GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+        GPIO_InitStruct.Pull = GPIO_NOPULL;
+        HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+        uint16_t ecnt = 0, prev = (uint16_t)(GPIOA->IDR & GPIO_PIN_4);
+        uint16_t ts = (uint16_t)TIM21->CNT;
+        while ((uint16_t)((uint16_t)TIM21->CNT - ts) < 15000U) {
+            uint16_t cur = (uint16_t)(GPIOA->IDR & GPIO_PIN_4);
+            if (cur != prev) { ecnt++; prev = cur; }
+        }
+        g_rfdiag2.edges_arr[j] = ecnt;
+        GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+        HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+    }
+    RFID_Carrier_Start(237);
+
+    /* 8. Check PB2 and PH1 carefully (50ms pull-up settle, safe push-pull only if pull-up reaches 1) */
+    RFID_Carrier_Stop();
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Pin = GPIO_PIN_2;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+    HAL_Delay(10);
+    g_rfdiag3.pb2_nop_off = (uint8_t)HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_2);
+
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+    HAL_Delay(50);
+    g_rfdiag3.pb2_pup_50ms = (uint8_t)HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_2);
+
+    GPIO_InitStruct.Pin = GPIO_PIN_1;
+    HAL_GPIO_Init(GPIOH, &GPIO_InitStruct);
+    HAL_Delay(50);
+    g_rfdiag3.ph1_pup_50ms = (uint8_t)HAL_GPIO_ReadPin(GPIOH, GPIO_PIN_1);
+
+    RFID_Carrier_Start(237);
+    HAL_Delay(15);
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Pin = GPIO_PIN_2;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+    HAL_Delay(5);
+    g_rfdiag3.pb2_nop_237 = (uint8_t)HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_2);
+
+    uint16_t sp_d3;
+    if (g_rfdiag3.pb2_pup_50ms) {
+        GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+        GPIO_InitStruct.Pin = GPIO_PIN_2;
+        HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET);
+        HAL_Delay(15);
+        ADC_Sample_Stats(7, 16, &g_rfdiag3.pb2_lo_pa7, &sp_d3);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_SET);
+        HAL_Delay(15);
+        ADC_Sample_Stats(7, 16, &g_rfdiag3.pb2_hi_pa7, &sp_d3);
+        GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+        GPIO_InitStruct.Pull = GPIO_PULLUP;
+        HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+    }
+    if (g_rfdiag3.ph1_pup_50ms) {
+        GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+        GPIO_InitStruct.Pin = GPIO_PIN_1;
+        HAL_GPIO_Init(GPIOH, &GPIO_InitStruct);
+        HAL_GPIO_WritePin(GPIOH, GPIO_PIN_1, GPIO_PIN_RESET);
+        HAL_Delay(15);
+        ADC_Sample_Stats(7, 16, &g_rfdiag3.ph1_lo_pa7, &sp_d3);
+        HAL_GPIO_WritePin(GPIOH, GPIO_PIN_1, GPIO_PIN_SET);
+        HAL_Delay(15);
+        ADC_Sample_Stats(7, 16, &g_rfdiag3.ph1_hi_pa7, &sp_d3);
+        GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+        GPIO_InitStruct.Pull = GPIO_NOPULL;
+        HAL_GPIO_Init(GPIOH, &GPIO_InitStruct);
+    }
+
+    /* 9. TIM2 duty cycle sweep at ARR=237 */
+    static const uint16_t ccrs[11] = {20, 40, 60, 80, 100, 119, 140, 160, 180, 200, 220};
+    for (int i = 0; i < 11; i++) {
+        uint16_t avg4;
+        g_rfdiag3.duty_ccr[i] = ccrs[i];
+        TIM2->CCR1 = ccrs[i];
+        HAL_Delay(15);
+        ADC_Sample_Stats(7, 16, &g_rfdiag3.duty_pa7[i], &sp_d3);
+        ADC_Sample_Stats(4, 32, &avg4, &g_rfdiag3.duty_pa4_span[i]);
+    }
+    TIM2->CCR1 = 119;
+
+    /* 10. PC0/PC1 bias + PA5/PA6 at ARR=350 vs ARR=237 */
+    HAL_Delay(15);
+    ADC_Sample_Stats(10, 16, &g_rfdiag3.pc0_237, &sp_d3);
+    ADC_Sample_Stats(11, 16, &g_rfdiag3.pc1_237, &sp_d3);
+    RFID_Carrier_Start(350);
+    HAL_Delay(20);
+    ADC_Sample_Stats(10, 16, &g_rfdiag3.pc0_350, &sp_d3);
+    ADC_Sample_Stats(11, 16, &g_rfdiag3.pc1_350, &sp_d3);
+    ADC1->SMPR = ADC_SAMPLETIME_12CYCLES_5;
+    ADC_Capture_Burst(5, g_rfdiag3.fast350_pa5, 24);
+    ADC_Capture_Burst(6, g_rfdiag3.fast350_pa6, 24);
+    ADC1->SMPR = ADC_SAMPLETIME_160CYCLES_5;
+
+    /* 11. Push-pull HIGH test on all safe high-Z pins at ARR=237 */
+    RFID_Carrier_Start(237);
+    HAL_Delay(15);
+    ADC_Sample_Stats(7, 16, &g_rfdiag3.pp_hi_base_pa7, &sp_d3);
+    const uint16_t hi_skip[6] = {
+        (uint16_t)(GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_4 | GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7 | GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15),
+        (uint16_t)(GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5 | GPIO_PIN_11),
+        (uint16_t)(GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_4 | GPIO_PIN_6 | GPIO_PIN_7 | GPIO_PIN_8 | GPIO_PIN_10),
+        0U,
+        (uint16_t)(GPIO_PIN_4 | GPIO_PIN_9 | GPIO_PIN_11 | GPIO_PIN_12),
+        (uint16_t)(GPIO_PIN_0 | GPIO_PIN_1)
+    };
+    for (int p = 0; p < 6; p++) {
+        uint16_t mask = (uint16_t)(g_rfdiag2.gpio_pup[p] & ~g_rfdiag2.gpio_pdn[p] & ~hi_skip[p]);
+        for (uint16_t b = 0; b < 16; b++) {
+            uint16_t bit = (uint16_t)(1U << b);
+            if ((mask & bit) == 0U) continue;
+            GPIO_InitStruct.Pin = bit;
+            GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+            GPIO_InitStruct.Pull = GPIO_NOPULL;
+            HAL_GPIO_Init(ports[p], &GPIO_InitStruct);
+            HAL_GPIO_WritePin(ports[p], bit, GPIO_PIN_SET);
+            HAL_Delay(5);
+            uint16_t p7 = 0;
+            ADC_Sample_Stats(7, 8, &p7, &sp_d3);
+            if ((int)p7 - (int)g_rfdiag3.pp_hi_base_pa7 > 60 || (int)g_rfdiag3.pp_hi_base_pa7 - (int)p7 > 60) {
+                g_rfdiag3.pp_hi_hit_port = (uint16_t)p;
+                g_rfdiag3.pp_hi_hit_pin = b;
+                g_rfdiag3.pp_hi_pa7 = p7;
+            }
+            GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+            GPIO_InitStruct.Pull = GPIO_PULLUP;
+            HAL_GPIO_Init(ports[p], &GPIO_InitStruct);
+        }
+    }
+
+    /* 12. Signal-flow map with safe 40k internal PULLDOWN / PULLUP (TX OFF) */
+    RFID_Carrier_Stop();
+    HAL_Delay(20);
+    static const uint32_t probe_ch[6] = {4, 5, 6, 7, 10, 11};
+    static GPIO_TypeDef *const probe_port[5] = {GPIOA, GPIOA, GPIOA, GPIOC, GPIOC};
+    static const uint16_t probe_pin[5] = {GPIO_PIN_4, GPIO_PIN_5, GPIO_PIN_6, GPIO_PIN_0, GPIO_PIN_1};
+    for (int c = 0; c < 6; c++) {
+        ADC_Sample_Stats(probe_ch[c], 8, &g_rfdiag4.base_adc[c], &sp_d3);
+    }
+    for (int i = 0; i < 5; i++) {
+        GPIO_InitStruct.Pin = probe_pin[i];
+        GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+        GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+        HAL_GPIO_Init(probe_port[i], &GPIO_InitStruct);
+        HAL_Delay(10);
+        g_rfdiag4.pdn_pb2[i] = (uint8_t)HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_2);
+        for (int c = 0; c < 6; c++) {
+            if ((i < 3 && c == i) || (i >= 3 && c == i + 1)) {
+                g_rfdiag4.pdn_effect[i][c] = (uint16_t)(HAL_GPIO_ReadPin(probe_port[i], probe_pin[i]) ? 4095 : 0);
+            } else {
+                ADC_Sample_Stats(probe_ch[c], 8, &g_rfdiag4.pdn_effect[i][c], &sp_d3);
+            }
+        }
+        GPIO_InitStruct.Pull = GPIO_PULLUP;
+        HAL_GPIO_Init(probe_port[i], &GPIO_InitStruct);
+        HAL_Delay(10);
+        g_rfdiag4.pup_pb2[i] = (uint8_t)HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_2);
+        for (int c = 0; c < 6; c++) {
+            if ((i < 3 && c == i) || (i >= 3 && c == i + 1)) {
+                g_rfdiag4.pup_effect[i][c] = (uint16_t)(HAL_GPIO_ReadPin(probe_port[i], probe_pin[i]) ? 4095 : 0);
+            } else {
+                ADC_Sample_Stats(probe_ch[c], 8, &g_rfdiag4.pup_effect[i][c], &sp_d3);
+            }
+        }
+        GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+        GPIO_InitStruct.Pull = GPIO_NOPULL;
+        HAL_GPIO_Init(probe_port[i], &GPIO_InitStruct);
+    }
+
+    /* 13. Check PB2 edges at ARR=237, 340, 350 */
+    static const uint16_t pb2_arrs[3] = {237, 340, 350};
+    for (int j = 0; j < 3; j++) {
+        RFID_Carrier_Start(pb2_arrs[j]);
+        HAL_Delay(25);
+        if (j == 1) ADC_Sample_Stats(7, 8, &g_rfdiag4.pa7_340, &sp_d3);
+        if (j == 2) ADC_Sample_Stats(7, 8, &g_rfdiag4.pa7_350, &sp_d3);
+        uint16_t cnt = 0, prev = (uint16_t)(GPIOB->IDR & GPIO_PIN_2);
+        uint16_t ts = (uint16_t)TIM21->CNT;
+        while ((uint16_t)((uint16_t)TIM21->CNT - ts) < 20000U) {
+            uint16_t cur = (uint16_t)(GPIOB->IDR & GPIO_PIN_2);
+            if (cur != prev) { cnt++; prev = cur; }
+        }
+        if (j == 0) g_rfdiag4.pb2_edges_237 = cnt;
+        else if (j == 1) g_rfdiag4.pb2_edges_340 = cnt;
+        else g_rfdiag4.pb2_edges_350 = cnt;
+    }
+
+    /* 14. Test AC-coupled PB13 (C603) + PB14 (C602) charge-pump/gate drive */
+    GPIO_InitStruct.Pin = GPIO_PIN_13 | GPIO_PIN_14;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    static const uint32_t d5_chs[5] = {4, 5, 6, 7, 11};
+    uint16_t d5_sp;
+    RFID_Carrier_Stop();
+    HAL_Delay(40);
+    for (int c = 0; c < 5; c++) ADC_Sample_Stats(d5_chs[c], 16, &g_rfdiag5.off_base[c], &d5_sp);
+    g_rfdiag5.off_base[5] = (uint16_t)HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_2);
+
+    for (int mode = 0; mode < 4; mode++) {
+        if (mode == 2) {
+            RFID_Carrier_Start(237);
+            HAL_Delay(30);
+            for (int c = 0; c < 5; c++) ADC_Sample_Stats(d5_chs[c], 16, &g_rfdiag5.tx237_base[c], &d5_sp);
+            g_rfdiag5.tx237_base[5] = (uint16_t)HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_2);
+        }
+        uint16_t half_us = (mode == 3) ? 25U : 5U;
+        uint32_t bsrr_a = (mode == 1) ? (GPIO_PIN_13 | GPIO_PIN_14) : (GPIO_PIN_13 | ((uint32_t)GPIO_PIN_14 << 16));
+        uint32_t bsrr_b = (mode == 1) ? (((uint32_t)GPIO_PIN_13 << 16) | ((uint32_t)GPIO_PIN_14 << 16))
+                                      : (((uint32_t)GPIO_PIN_13 << 16) | GPIO_PIN_14);
+        uint32_t n_half = (mode == 3) ? 1000U : 5000U; /* 25 ms total */
+        uint16_t t_next = (uint16_t)TIM21->CNT;
+        for (uint32_t k = 0; k < n_half; k++) {
+            GPIOB->BSRR = (k & 1U) ? bsrr_b : bsrr_a;
+            while ((uint16_t)((uint16_t)TIM21->CNT - t_next) < half_us) {}
+            t_next = (uint16_t)(t_next + half_us);
+        }
+        volatile uint16_t *dst = (mode == 0) ? g_rfdiag5.off_comp_100k :
+                                 (mode == 1) ? g_rfdiag5.off_inph_100k :
+                                 (mode == 2) ? g_rfdiag5.tx237_comp_100k :
+                                               g_rfdiag5.tx237_comp_20k;
+        for (int c = 0; c < 5; c++) {
+            ADC1->CHSELR = (1U << d5_chs[c]);
+            uint32_t sum = 0;
+            for (int s = 0; s < 16; s++) {
+                GPIOB->BSRR = (s & 1U) ? bsrr_b : bsrr_a;
+                ADC1->CR |= ADC_CR_ADSTART;
+                while ((ADC1->ISR & ADC_ISR_EOC) == 0U) {}
+                sum += (uint16_t)ADC1->DR;
+            }
+            dst[c] = (uint16_t)(sum / 16U);
+        }
+        dst[5] = (uint16_t)HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_2);
+    }
+
+    GPIO_InitStruct.Pin = GPIO_PIN_13 | GPIO_PIN_14;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    /* 15. Compare HSI vs synchronous 32MHz HSE_BYPASS across 3 Q603 tune levels at ARR=238 */
+    RFID_Carrier_Start(238);
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 1) {
+            HSE_Enter_32MHz();
+            g_rfdiag10.hserdy = (RCC->CR & RCC_CR_HSERDY) ? 1U : 0U;
+            g_rfdiag10.sws_hse = ((RCC->CFGR & RCC_CFGR_SWS) == RCC_CFGR_SWS_HSE) ? 1U : 0U;
+        }
+
+        for (int lvl = 0; lvl < 3; lvl++) {
+            GPIO_InitStruct.Pin = GPIO_PIN_13 | GPIO_PIN_14;
+            GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+            GPIO_InitStruct.Pull = GPIO_NOPULL;
+            GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+            HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+            if (lvl == 0) {
+                /* Discharge Q603 via PB13 only, PB2=INPUT */
+                GPIO_InitStruct.Pin = GPIO_PIN_2;
+                GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+                GPIO_InitStruct.Pull = GPIO_NOPULL;
+                HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+                uint16_t tn = (uint16_t)TIM21->CNT;
+                for (uint32_t k = 0; k < 1500U; k++) {
+                    GPIOB->BSRR = (k & 1U) ? ((uint32_t)GPIO_PIN_13 << 16) : GPIO_PIN_13;
+                    while ((uint16_t)((uint16_t)TIM21->CNT - tn) < 20U) {}
+                    tn = (uint16_t)(tn + 20U);
+                }
+            } else if (lvl == 1) {
+                /* Charge Q603 via PB14/PB13 comp, PB2=INPUT (PA7 ~ 1750) */
+                GPIO_InitStruct.Pin = GPIO_PIN_2;
+                GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+                GPIO_InitStruct.Pull = GPIO_NOPULL;
+                HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+                uint16_t tn = (uint16_t)TIM21->CNT;
+                for (uint32_t k = 0; k < 4000U; k++) {
+                    GPIOB->BSRR = (k & 1U) ? (((uint32_t)GPIO_PIN_13 << 16) | GPIO_PIN_14)
+                                           : (GPIO_PIN_13 | ((uint32_t)GPIO_PIN_14 << 16));
+                    while ((uint16_t)((uint16_t)TIM21->CNT - tn) < 5U) {}
+                    tn = (uint16_t)(tn + 5U);
+                }
+            } else {
+                /* Full tune: PB2=HIGH + 100kHz comp (PA7 ~ 3700) */
+                RFID_Pump_Tune_Enable(25U);
+            }
+            GPIOB->BSRR = ((uint32_t)GPIO_PIN_13 << 16) | ((uint32_t)GPIO_PIN_14 << 16);
+
+            uint16_t tw = (uint16_t)TIM21->CNT;
+            while ((uint16_t)((uint16_t)TIM21->CNT - tw) < 10000U) {}
+
+            uint16_t avg_tmp;
+            if (pass == 0) {
+                ADC_Sample_Stats(7, 32, &g_rfdiag10.hsi_pa7[lvl], &d5_sp);
+                ADC_Sample_Stats(4, 32, &avg_tmp, &g_rfdiag10.hsi_pa4_sp[lvl]);
+                ADC_Sample_Stats(5, 32, &avg_tmp, &g_rfdiag10.hsi_pa5_sp[lvl]);
+                ADC_Sample_Stats(6, 32, &avg_tmp, &g_rfdiag10.hsi_pa6_sp[lvl]);
+            } else {
+                ADC_Sample_Stats(7, 32, &g_rfdiag10.hse_pa7[lvl], &d5_sp);
+                ADC_Sample_Stats(4, 32, &avg_tmp, &g_rfdiag10.hse_pa4_sp[lvl]);
+                ADC_Sample_Stats(5, 32, &avg_tmp, &g_rfdiag10.hse_pa5_sp[lvl]);
+                ADC_Sample_Stats(6, 32, &avg_tmp, &g_rfdiag10.hse_pa6_sp[lvl]);
+                if (lvl == 1) {
+                    ADC1->SMPR = ADC_SAMPLETIME_12CYCLES_5;
+                    ADC_Capture_Burst(5, g_rfdiag10.hse_pa5_l1, 32);
+                    ADC1->SMPR = ADC_SAMPLETIME_160CYCLES_5;
+                } else if (lvl == 2) {
+                    ADC1->SMPR = ADC_SAMPLETIME_12CYCLES_5;
+                    ADC_Capture_Burst(5, g_rfdiag10.hse_pa5_l2, 32);
+                    ADC1->SMPR = ADC_SAMPLETIME_160CYCLES_5;
+                }
+            }
+        }
+
+        if (pass == 1) {
+            HSE_Exit_To_HSI_PLL();
+            g_rfdiag10.reverted_pll = ((RCC->CFGR & RCC_CFGR_SWS) == RCC_CFGR_SWS_PLL) ? 1U : 0U;
+        }
+    }
+
+    RFID_Carrier_Start(237);
+    HAL_ADC_Stop(&hadc);
+}
+
 void GPIO_Init_All(void)
 {
     __HAL_RCC_GPIOA_CLK_ENABLE();
@@ -796,6 +2613,7 @@ void GPIO_Init_All(void)
     __HAL_RCC_GPIOC_CLK_ENABLE();
     __HAL_RCC_GPIOD_CLK_ENABLE();
     __HAL_RCC_GPIOE_CLK_ENABLE();
+    __HAL_RCC_GPIOH_CLK_ENABLE();
 
     GPIO_InitTypeDef GPIO_InitStruct = {0};
 
@@ -850,6 +2668,16 @@ void GPIO_Init_All(void)
     /* Port E: All inputs with PULL-UP (skip PE4 for slider ground, and PE11 & PE12 for motor) */
     GPIO_InitStruct.Pin = GPIO_PIN_All & ~(GPIO_PIN_4 | GPIO_PIN_11 | GPIO_PIN_12);
     HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
+    /* Port H: Leave PH0 untouched when HSE is active; PH9/PH10 with PULLUP */
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Pin = g_rfdiag.hse_active ? GPIO_PIN_1 : (GPIO_PIN_0 | GPIO_PIN_1);
+    HAL_GPIO_Init(GPIOH, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Pin = GPIO_PIN_9 | GPIO_PIN_10;
+    HAL_GPIO_Init(GPIOH, &GPIO_InitStruct);
 
     /* PE4 (Pin 3): Slider Switch Common Ground Driver -> driven LOW (0V) */
     GPIO_InitStruct.Pin = GPIO_PIN_4;
@@ -973,6 +2801,7 @@ void SystemClock_Config(void)
 
     __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
 
+    /* Safe initial boot on HSI PLL 32 MHz */
     RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
     RCC_OscInitStruct.HSIState = RCC_HSI_ON;
     RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
@@ -989,6 +2818,7 @@ void SystemClock_Config(void)
     RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
     RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
     HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1);
+    g_rfdiag.hse_active = 0;
 }
 
 void SysTick_Handler(void)

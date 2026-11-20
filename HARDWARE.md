@@ -140,8 +140,76 @@ The user controls on the daughterboard connect via a 5-pin ribbon cable:
 
 ---
 
-## 4. Work in Progress (Upcoming Subsystems)
-* **Single-Button Interactive Lid Control:** Integrate break-beam pet safety into lid opening/closing logic (automatic lid open on pet approach, safety stall cutoff, re-open if pet enters while closing).
-* **RFID Transceiver:** 134.2 kHz carrier generator (PWM timer) and envelope receiver/comparator for ISO 11784/11785 FDX-B pet microchip decoding.
-* **Battery Voltage Monitor:** ADC resistor divider monitoring 4× C-cell battery health (nominal 6.0V down to 4.0V cutoff).
+### 3.6 RFID Transceiver — 134.2 kHz Synchronous TX Driver, Closed-Loop 600-Series Tank Tuner & 700-Series RX Demodulator (100% Reverse Engineered & Verified)
+
+#### 3.6.1 32.000 MHz Master Crystal & Synchronous Re-Clocking Stage (`Y101`, `IC102`, `IC103`)
+* **`Y101` (`32.000 MHz` SMD Crystal/Oscillator):** Master RF timing reference.
+* **`IC103` (`VHE`, Single Gate Buffer, SOT-23-5):**
+  * **Enable (`Pin 1`):** Controlled by **`PH10`** (STM32 Pin 11, pulled HIGH via `R108` $10\text{ k}\Omega$ / internal pull-up). Driving `PH10 = LOW` shuts down the $32.000\text{ MHz}$ clock output (`hserdy_lo = 0`); keeping `PH10 = HIGH` (`INPUT_PULLUP`) enables the buffer.
+  * **Clock Output:** Drives **`PH0-OSC_IN`** (STM32 Pin 12) via `R10` ($32.000\text{ MHz}$ external clock input for `HSE_BYPASS`).
+* **`IC102` (`C79J` = `SN74LVC1G79` Single Positive-Edge-Triggered D Flip-Flop, SOT-23-5):**
+  * **Data Input (`Pin 1`, `D`):** Driven by **`PE9`** (STM32 Pin 40, `TIM2_CH1` PWM carrier output, `AF0`).
+  * **Clock Input (`Pin 2`, `CLK`):** Driven directly from `Y101.1` via `R107` / `R105`.
+  * **Supply (`Pin 5`, `VCC`):** $+3.3\text{V}$ (`U1.50`, decoupled by `C105`/`C115`); `Pin 3` (`GND`) = `VSS`.
+  * **Re-Clocked Carrier Output (`Pin 4`, `Q`):** Feeds the dual gate-driver buffers `IC601` and `IC602` via `D603.3` and $1\text{ k}\Omega$ series resistors `R609` and `R610`.
+* **CRITICAL Firmware Requirement — Synchronous `32.000 MHz HSE_BYPASS` During RFID Scans:**
+  * If `TIM2` (`PE9`) runs off the STM32's internal `HSI` RC oscillator ($\sim 31.984\text{ MHz}$) while `IC102` re-clocks `PE9` against the $32.000\text{ MHz}$ `Y101` crystal, the $\sim 16\text{ kHz}$ frequency difference causes `IC102` to cycle-slip by $31.25\text{ ns}$ at a **$\sim 12.8\text{ kHz}$ beat frequency**.
+  * That $12.8\text{ kHz}$ phase/PWM slip modulates the high-$Q$ antenna tank right inside the RX filter passband, saturating `IC701` (`PA4` and `PA5` rail-to-rail at $\sim 4050\text{ ADC counts}$) and completely blinding the receiver.
+  * **Solution:** During every RFID scan window, firmware enables `RCC_CR_HSEBYP | RCC_CR_HSEON` and switches `SYSCLK` directly to **`RCC_CFGR_SW_HSE` ($32.000\text{ MHz}$ direct, NO PLL — never feed $32\text{ MHz}$ into `PLLMUL_4`, which would exceed the $96\text{ MHz}$ max VCO and lock the core)**, then reverts to `RCC_CFGR_SW_PLL` (`HSI * 4 / 2`) after the scan. Under synchronous `HSE_BYPASS`, the $12.8\text{ kHz}$ beat disappears completely (`PA4` span drops from $4036 \rightarrow 84\text{ counts}$; `PA5` span drops from $3252 \rightarrow 91\text{ counts}$).
+
+#### 3.6.2 134.2 kHz Coil Excitation Driver (`IC601`, `IC602`, `Q606`, `D603/605/606`, `C619`)
+* **`IC601` & `IC602` (Parallel SOT-23-5 Push-Pull Gate Buffers):**
+  * Inputs (`Pins 1 & 2`) fed from `IC102.4` via `R609`/`C617`/`D603.1` (`IC601`) and `R610`/`C618`/`D603.2` (`IC602`).
+  * Supply (`Pin 5`) fed from the $+6\text{V}$ battery rail via `R615` ($100\ \Omega$, decoupled by `C622`/`C623`).
+  * Outputs (`IC601.4` $\rightarrow$ `R611` $\rightarrow$ `Q606.3`; `IC602.4` $\rightarrow$ `R612` $\rightarrow$ `Q606.1`).
+* **`Q606` (SOT-23-6 Complementary / Dual MOSFET Stage):**
+  * Supply/return path via `Q606.2` $\rightarrow$ `D606.1/2` $\rightarrow$ `D605.1(K)` $\rightarrow$ `D605.2(A)` $\rightarrow$ `C625` / `R616` ($0.47\ \Omega$) / `C626` ($220\ \mu\text{F}\ 16\text{V}$ bulk reservoir).
+  * Output (`Q606.4 & 6`) drives antenna pad **`TPA1`** (`A601`) and parallel snubber capacitor `C619` (to `GND`).
+* **Carrier Frequency (`TIM2_CH1` on `PE9` at $32.000\text{ MHz}$):**
+  * `ARR = 238, CCR1 = 119` $\rightarrow$ $32.000\text{ MHz} / 239 = \mathbf{133.89\text{ kHz}}$
+  * `ARR = 237, CCR1 = 119` $\rightarrow$ $32.000\text{ MHz} / 238 = \mathbf{134.45\text{ kHz}}$
+  * Nominal ISO 11784/11785 FDX-B frequency = $\mathbf{134.2\text{ kHz}}$.
+
+#### 3.6.3 600-Series High-Voltage Tank Resonance Tuner & Closed-Loop AGC (`Q603`, `Q601/602/604/607`, `D601/602/604`, `PB13`, `PB14`, `PB2`, `PA7`)
+* **Unswitched vs. Tuned Resonance:**
+  * With `Q603` (`FQD6N40C`, $400\text{V}$ DPAK N-MOSFET) **OFF**, the antenna tank (`TPA0` $\leftrightarrow$ `C609/C610/C612/C613/C607/C605`) self-resonates at **$\sim 93.8\text{ kHz}$ (`ARR = 340`)**, producing minimal amplitude at $134.2\text{ kHz}$ (`PA7` $\approx 460\text{ counts}$).
+  * Turning `Q603` **ON** (and biasing `Q604`/`Q607`) switches the tuning capacitor network onto the $134.2\text{ kHz}$ band, raising `PA7` at `ARR = 238` from $460\text{ counts}$ all the way up to $3869\text{--}4095\text{ counts}$.
+* **AC-Coupled Gate Charge Pump & Discharge Control:**
+  * **`PB14` (STM32 Pin 53) — Charge-UP Pump:** AC-coupled through series capacitor **`C602`** $\rightarrow$ `R602` / `D601` / `Q601` $\rightarrow$ gate storage capacitor **`C604.2`** $\rightarrow$ `R604` $\rightarrow$ **`Q603.1` (Gate)**. Pulsing `PB14` ($20\text{--}100\text{ kHz}$) steps `Q603` gate voltage **UP**, increasing tank resonance amplitude at $134.2\text{ kHz}$.
+  * **`PB13` (STM32 Pin 52) — Discharge-DOWN Pump:** AC-coupled through series capacitor **`C603`** $\rightarrow$ `R603` / `D602` (referenced to `GND`) / `Q602` $\rightarrow$ **`C604.2`** (`Q603.1` Gate). Pulsing `PB13` alone discharges `C604.2`, stepping `Q603` gate voltage **DOWN** (`PA7` at `ARR = 238` returns to $459\text{ counts}$ and `ARR = 340` returns to $2733\text{ counts}$).
+  * **`PB2` (STM32 Pin 37) — High-Range Bias Switch (`Q607`):** Drives `Q607.1` (`6CW` NPN base) via `R605`, coupling `Q607.3` (`R618`/`R617`/`C601.1`/`Q604.1`) to `Q607.2` (`C611.1`/`R606.2`/`C606.1`/`C604.1`). Driving `PB2 = HIGH` shifts the tank to maximum amplitude (`PA7` $= 3585\text{--}4095$ at `ARR = 238..255`).
+* **Tank Envelope Detector (`D604` $\rightarrow$ `PA7` / Pin 32 / `ADC_IN7`):**
+  * `D604.3` connects to `Q603.3` (`TAB`/Drain) and tank capacitor bank `C607.2`/`C609.2`/`C610.2`/`C612.2`/`C613.2`.
+  * `D604.2` rectifies the tank envelope onto `C620` (to `GND`), feeds voltage divider `R613` / `R614` + filter cap `C621` into **`PA7` (`ADC_IN7`)**, and AC-couples via **`C706`** into the `700`-series RX amplifier (`R704` $\rightarrow$ `D701.3` $\rightarrow$ `IC701.3`).
+* **Closed-Loop Servo Setpoint (`RFID_Servo_PA7`):**
+  * Under synchronous $32.000\text{ MHz}$ `HSE_BYPASS`, over-pumping `PA7` above $\sim 1600\text{ counts}$ overdrives the `D701.3`/`IC701` front-end into self-oscillation.
+  * Regulating `PA7` to **`1100–1400 counts`** (via `PB14` UP / `PB13` DOWN bursts with `PB2 = INPUT`) keeps the $134.2\text{ kHz}$ field strong while `IC701` stays completely quiet at idle (`PA4` span $\approx 80\text{--}110\text{ counts}$, `PA5` span $\approx 90\text{--}160\text{ counts}$, `0` false edges) and yields a massive $2000\text{--}3500\text{ count}$ swing when an FDX-B microchip enters the arch.
+
+#### 3.6.4 700-Series Quad Op-Amp RX Chain (`IC701`, `IC702`, `IC703`, `IC704`, `Q702`–`Q704`, `D701`, `D102`)
+* **RX Power & Mid-Rail `V_REF` Switch (`PB11` / Pin 48):**
+  * Driving **`PB11 = HIGH`** turns on `Q702` (via `R701`), which switches on high-side transistor `Q703` (`R702`/`R703`/`R706`/`R707`), powering the RX rail and generating the half-supply bias reference **`V_REF`** (`Q703.2` $\rightarrow$ `R708`/`C731` $\rightarrow$ `+` inputs `IC701.5, 10, 12` and `IC702.3, 5, 10, 12`) as well as voltage divider `R111`/`R112` (`C121`) monitored on **`PC1` (`ADC_IN11` $\approx 2840\text{ counts}$ when ON, $0$ when OFF)**.
+* **`IC701` (`TL974I` Rail-to-Rail Very-Low-Noise Quad Op-Amp, TSSOP-14):**
+  * **Stage 1 (`Pins 1, 2, 3` — Input Buffer):** Tank envelope from `D604.2` couples through `C706` $\rightarrow$ `R704` $\rightarrow$ `D701.3` / `IC701.3` (`1IN+`, biased by `R705` to `V_REF`). `IC701.1` (`OUT1`) ties to `IC701.2` (`1IN-`) as a unity-gain follower.
+  * **Stage 2 (`Pins 5, 6, 7` — Primary FDX-B Baseband Amplifier $\rightarrow$ `PA5`):** `IC701.1` couples via `C712` $\rightarrow$ `R718` $\rightarrow$ `IC701.6` (`2IN-`), with bandpass feedback `R719` $\parallel$ `C713` to `IC701.7` (`OUT2`). Output feeds `R720` $\rightarrow$ `C714.1` $\rightarrow$ **`D102.2` $\rightarrow$ `PA5` (STM32 Pin 30, `ADC_IN5`)**.
+  * **Stages 4 & 3 (`Pins 12–14` & `8–10` — Cascaded Bandpass Filter $\rightarrow$ `PA4`):** `IC701.1` feeds `R711` $\rightarrow$ `C707`/`C708`/`R897`/`R713` into `IC701.13/14`, then via `R714`/`R715`/`C710`/`C709`/`R716` into `IC701.9/8` (`OUT3`), driving `R717` $\rightarrow$ `C711.1` $\rightarrow$ **`D102.1` $\rightarrow$ `PA4` (STM32 Pin 29, `ADC_IN4`)**.
+  * **`D102` (Dual Series Clamp Diode to $+3.3\text{V}$):** `D102.3` ties to `VDD_3V3` (`U1.75`), clamping both `PA4` (`D102.1`) and `PA5` (`D102.2`) to $+3.3\text{V}$ to protect the STM32 ADC inputs from the $+5.8\text{V}$-supplied op-amps.
+* **`IC702` (`TL974I` Second Quad Op-Amp), `Q704`, `IC703` & `IC704` ($\rightarrow$ `PA6` / Pin 31 / `ADC_IN6`):**
+  * `IC701.1` also feeds `R722`/`R723`/`C717` through three stages of `IC702` (`OUT1` `Pin 1` $\rightarrow$ `OUT2` `Pin 7` $\rightarrow$ `OUT3` `Pin 8` $\rightarrow$ `R730`/`C722` $\rightarrow$ `Q704.1`) and envelope/comparator stages `IC703`/`IC704` (`R736` $\rightarrow$ `C727`/`C728`/`R737`/`C729`) and `IC702.14` (`OUT4`, `R738`/`R739`/`C730`), observed on **`PA6` (`ADC_IN6`)**.
+
+#### 3.6.5 ISO 11784 / 11785 FDX-B 128-Bit Frame Protocol & Verified SureFlap Tags
+* **Modulation & Bit Timing:**
+  * Subcarrier bit rate: $134,200\text{ Hz} / 32 = \mathbf{4,193.75\text{ bps}}$ (**$238.45\ \mu\text{s}$ full-bit**, **$119.23\ \mu\text{s}$ half-bit**).
+  * Differential Bi-Phase (DBP / Bi-Phase Mark): transition at every bit boundary; **`0` bit** = mid-bit transition (two $\sim 119\ \mu\text{s}$ half-bit intervals); **`1` bit** = no mid-bit transition (one $\sim 238\ \mu\text{s}$ full-bit interval, which also uniquely locks bit-cell boundary phase).
+* **128-Bit Frame Layout:**
+  * **11-Bit Sync Header:** `00000000001` ($10$ zeros + $1$, unique across the entire frame because every subsequent byte has a trailing `'1'` control bit).
+  * **13 Blocks $\times$ 9 Bits ($117\text{ bits}$):** Each block has $8$ data bits (LSB first) followed by $1$ control bit (must be `'1'`, yielding `ctrl_bits_mask = 0x1FFF`).
+    * **Bytes `0..7` ($64\text{ bits}$, LSB first):**
+      * Bits `0..37` ($38\text{ bits}$): **National ID** ($12\text{-digit}$ decimal, `id64 & 0x3FFFFFFFFFULL`).
+      * Bits `38..47` ($10\text{ bits}$): **Country / Manufacturer Code** ($3\text{-digit}$ decimal, `(id64 >> 38) & 0x3FFU`).
+      * Bit `63` ($1\text{ bit}$): **Animal Application Flag** (`1` = animal tag, `0x80` in `byte[7]`).
+    * **Bytes `8..9` ($16\text{ bits}$, LSB first):** **16-Bit CRC-CCITT** (reflected polynomial `0x8408`, init `0x0000` over `byte[0..7]`).
+    * **Bytes `10..12` ($24\text{ bits}$):** Extension / trailer bytes.
+* **Verified Hardware Tag Reads (`100%` CRC-16 Match):**
+  * **SureFlap Tag 1:** `051-073300800864` (`raw_id64 = 0x80000cd111117560`, `CRC = 0x0e19 == 0x0e19`, $33/33$ frames valid)
+  * **SureFlap Tag 2:** `051-073300800887` (`raw_id64 = 0x80000cd111117577`, `CRC = 0xc96f == 0xc96f`)
 
