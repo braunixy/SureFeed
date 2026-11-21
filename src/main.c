@@ -387,6 +387,10 @@ typedef struct {
     uint32_t training_stage;                 /* 0=Normal, 1..4=Official Training Stages 1..4 */
     uint32_t close_delay_ms;                 /* Slider close delay: I=3500ms, II=6000ms, III=10000ms */
     uint32_t factory_reset_count;            /* Number of factory resets executed */
+    uint32_t recheck_count;                  /* 5s anti-hijack RFID rechecks started */
+    uint32_t recheck_auth_count;             /* Rechecks confirming an authorized pet */
+    uint32_t intruder_close_count;           /* Slow closes triggered by wrong-pet detection */
+    uint32_t intruder_closing;               /* 1 while slow (33%) intruder close is active */
     uint32_t ir_online;                      /* 1 once unobstructed IR beam is detected */
     uint32_t clear_req;                      /* Set to 1 in GDB to wipe learned pets */
 } PetRegistry;
@@ -444,6 +448,7 @@ void Motor_Drive(MotorDirection dir, uint32_t duty_pct);
 void Motor_Set(MotorDirection dir);
 void Lid_Start_Opening(LidState target_mode);
 void Lid_Start_Closing(void);
+void Lid_Start_Closing_Duty(uint32_t duty_pct);
 void Lid_Stop_Motion(uint32_t stop_reason);
 void RFID_Scan_Start(void);
 void RFID_Scan_Stop(void);
@@ -697,6 +702,11 @@ int main(void)
     uint32_t motor_partial_close_ms = 0U;
     uint32_t ir_rfid_active_until = 0U;
     uint32_t ir_last_blocked_time = 0U;
+    uint32_t recheck_next_at = 0U;
+    uint32_t recheck_active_until = 0U;
+    uint8_t  recheck_saw_auth = 0U;
+    uint8_t  recheck_saw_unauth = 0U;
+    uint8_t  stall_confirm = 0U;
     g_pets.close_delay_ms = 6000U;
 
     uint16_t prev_idr_A = (uint16_t)GPIOA->IDR;
@@ -824,6 +834,8 @@ int main(void)
 
         /* --- 3. Button Action Handling --- */
         if (btn_pressed_event == BTN_OPEN_CLOSE) {
+            g_pets.intruder_closing = 0U;
+            recheck_active_until = 0U;
             if (g_diag.lid_state == LID_CLOSED) {
                 /* User manually opened lid: hold open and DEACTIVATE automatic mode */
                 g_diag.auto_mode_active = 0;
@@ -976,60 +988,120 @@ int main(void)
                 RFID_Learn_Stop();
                 RFID_Power_Down();
                 ir_last_blocked_time = HAL_GetTick();
+                recheck_next_at = ir_last_blocked_time + 5000U;
+                recheck_active_until = 0U;
                 learn_success_until = ir_last_blocked_time + 2500U;
             }
         } else if (g_diag.auto_mode_active) {
             if (g_diag.ir_blocked) {
                 ir_last_blocked_time = now;
-                if (g_diag.lid_state == LID_CLOSING) {
-                    /* Safety re-open if pet breaks IR beam while lid is closing */
+                if (g_diag.lid_state == LID_CLOSING && !g_pets.intruder_closing) {
+                    /* Normal close safety: re-open if pet breaks IR beam while closing */
                     motor_partial_close_ms = 0U;
+                    recheck_active_until = 0U;
                     Lid_Start_Opening(LID_OPEN_AUTO);
                 } else if (g_diag.lid_state == LID_CLOSED && g_pets.training_stage != 1U) {
                     ir_rfid_active_until = now + 2000U;
                 }
             }
 
-            uint8_t want_rfid = (g_diag.lid_state == LID_CLOSED &&
-                                 g_pets.training_stage != 1U &&
-                                 (g_diag.ir_blocked ||
-                                  (ir_rfid_active_until != 0U && (int32_t)(ir_rfid_active_until - now) > 0))) ? 1U : 0U;
-
-            if (want_rfid) {
-                uint32_t prev_crc = g_fdxb.crc_ok_count;
-                RFID_Chip_Sweep();
-                if (g_fdxb.crc_ok_count != prev_crc && g_fdxb.raw_id64 != 0ULL) {
-                    g_pets.last_seen_id = g_fdxb.raw_id64;
-                    Format_ISO_Buf(g_pets.last_seen_iso, g_fdxb.raw_id64);
-                    if (Pets_Is_Authorized(g_fdxb.raw_id64)) {
-                        g_pets.last_authorized = 1U;
-                        g_pets.auth_open_count++;
-                        ir_rfid_active_until = 0U;
-                        ir_last_blocked_time = HAL_GetTick();
-                        RFID_Power_Down();
-                        motor_partial_close_ms = 0U;
-                        Lid_Start_Opening(LID_OPEN_AUTO);
-                    } else {
-                        g_pets.last_authorized = 0U;
-                        unauth_feedback_until = HAL_GetTick() + 1000U;
+            if (g_diag.lid_state == LID_OPEN_AUTO && g_pets.training_stage != 1U) {
+                if (g_diag.ir_blocked) {
+                    /* Anti-hijack guard: recheck every 5s while beam stays broken */
+                    if (recheck_active_until == 0U && (int32_t)(now - recheck_next_at) >= 0) {
+                        recheck_active_until = now + 1500U;
+                        recheck_saw_auth = 0U;
+                        recheck_saw_unauth = 0U;
+                        g_pets.recheck_count++;
                     }
-                }
-            } else {
-                if (s_rfid_powered || g_rfid.tx_enable) {
-                    RFID_Power_Down();
-                }
-                if (g_diag.lid_state == LID_OPEN_AUTO && !g_diag.ir_blocked && g_pets.training_stage != 1U) {
+                    if (recheck_active_until != 0U) {
+                        if ((int32_t)(recheck_active_until - now) > 0) {
+                            uint32_t prev_crc = g_fdxb.crc_ok_count;
+                            RFID_Chip_Sweep();
+                            if (g_fdxb.crc_ok_count != prev_crc && g_fdxb.raw_id64 != 0ULL) {
+                                g_pets.last_seen_id = g_fdxb.raw_id64;
+                                Format_ISO_Buf(g_pets.last_seen_iso, g_fdxb.raw_id64);
+                                if (Pets_Is_Authorized(g_fdxb.raw_id64)) {
+                                    g_pets.last_authorized = 1U;
+                                    g_pets.recheck_auth_count++;
+                                    recheck_saw_auth = 1U;
+                                    recheck_active_until = 0U;
+                                    recheck_next_at = HAL_GetTick() + 5000U;
+                                    RFID_Power_Down();
+                                } else {
+                                    g_pets.last_authorized = 0U;
+                                    recheck_saw_unauth = 1U;
+                                }
+                            }
+                        } else {
+                            recheck_active_until = 0U;
+                            RFID_Power_Down();
+                            if (recheck_saw_unauth && !recheck_saw_auth) {
+                                /* Only wrong pet detected: close gently at ~1/3 speed (33% PWM) */
+                                g_pets.intruder_close_count++;
+                                g_pets.intruder_closing = 1U;
+                                unauth_feedback_until = HAL_GetTick() + 1500U;
+                                motor_partial_close_ms = (g_pets.training_stage == 2U) ? 550U :
+                                                         (g_pets.training_stage == 3U) ? 1000U :
+                                                         (g_pets.training_stage == 4U) ? 1450U : 0U;
+                                Lid_Start_Closing_Duty(33U);
+                            } else {
+                                recheck_next_at = HAL_GetTick() + 5000U;
+                            }
+                        }
+                    }
+                } else {
+                    recheck_active_until = 0U;
+                    recheck_next_at = now + 5000U;
+                    if (s_rfid_powered || g_rfid.tx_enable) {
+                        RFID_Power_Down();
+                    }
                     /* Auto-close lid after slider delay (3.5s / 6.0s / 10.0s) once pet leaves the IR arch */
                     if ((now - ir_last_blocked_time) >= g_pets.close_delay_ms) {
+                        g_pets.intruder_closing = 0U;
                         motor_partial_close_ms = (g_pets.training_stage == 2U) ? 250U :
                                                  (g_pets.training_stage == 3U) ? 450U :
                                                  (g_pets.training_stage == 4U) ? 650U : 0U;
                         Lid_Start_Closing();
                     }
                 }
+            } else {
+                uint8_t want_rfid = (g_diag.lid_state == LID_CLOSED &&
+                                     g_pets.training_stage != 1U &&
+                                     (g_diag.ir_blocked ||
+                                      (ir_rfid_active_until != 0U && (int32_t)(ir_rfid_active_until - now) > 0))) ? 1U : 0U;
+
+                if (want_rfid) {
+                    uint32_t prev_crc = g_fdxb.crc_ok_count;
+                    RFID_Chip_Sweep();
+                    if (g_fdxb.crc_ok_count != prev_crc && g_fdxb.raw_id64 != 0ULL) {
+                        g_pets.last_seen_id = g_fdxb.raw_id64;
+                        Format_ISO_Buf(g_pets.last_seen_iso, g_fdxb.raw_id64);
+                        if (Pets_Is_Authorized(g_fdxb.raw_id64)) {
+                            g_pets.last_authorized = 1U;
+                            g_pets.auth_open_count++;
+                            g_pets.intruder_closing = 0U;
+                            ir_rfid_active_until = 0U;
+                            ir_last_blocked_time = HAL_GetTick();
+                            recheck_active_until = 0U;
+                            recheck_next_at = ir_last_blocked_time + 5000U;
+                            RFID_Power_Down();
+                            motor_partial_close_ms = 0U;
+                            Lid_Start_Opening(LID_OPEN_AUTO);
+                        } else {
+                            g_pets.last_authorized = 0U;
+                            unauth_feedback_until = HAL_GetTick() + 1000U;
+                        }
+                    }
+                } else {
+                    if (s_rfid_powered || g_rfid.tx_enable) {
+                        RFID_Power_Down();
+                    }
+                }
             }
         } else {
             /* Manual hold mode: keep RFID antenna powered down */
+            recheck_active_until = 0U;
             if (s_rfid_powered || g_rfid.tx_enable) {
                 RFID_Power_Down();
             }
@@ -1039,22 +1111,33 @@ int main(void)
         if (g_diag.lid_state == LID_OPENING || g_diag.lid_state == LID_CLOSING) {
             now = HAL_GetTick();
             uint32_t run_duration = (now >= motor_start_time) ? (now - motor_start_time) : 0;
+            uint32_t pe_before = GPIOE->ODR & (GPIO_PIN_11 | GPIO_PIN_12);
             uint16_t pc4 = ADC_Read_Fast(14);
-            g_diag.live_adc[14] = pc4;
+            uint32_t pe_after = GPIOE->ODR & (GPIO_PIN_11 | GPIO_PIN_12);
+            uint8_t  pc4_valid = (pe_before != 0U && pe_after == pe_before) ? 1U : 0U;
+            if (pc4_valid) {
+                g_diag.live_adc[14] = pc4;
+            }
 
             /* Periodic diagnostic logging every 100ms during run */
             if (run_duration > 0 && (now - last_run_log_time >= 100)) {
                 last_run_log_time = now;
-                Log_Event(6, run_duration, pc4, g_diag.lid_state);
+                Log_Event(6, run_duration, g_diag.live_adc[14], g_diag.lid_state);
             }
 
-            /* Training Mode partial close target or 4.0s safety timeout */
+            uint32_t timeout_ms = (s_target_duty_pct <= 45U) ? 8000U : 4000U;
+
+            /* Training Mode partial close target or safety timeout */
             if (g_diag.lid_state == LID_CLOSING && motor_partial_close_ms > 0U && run_duration >= motor_partial_close_ms) {
                 motor_partial_close_ms = 0U;
+                g_pets.intruder_closing = 0U;
+                stall_confirm = 0U;
                 Lid_Stop_Motion(0);
                 g_diag.lid_state = LID_CLOSED;
-            } else if (run_duration >= 4000) {
+            } else if (run_duration >= timeout_ms) {
                 motor_partial_close_ms = 0U;
+                g_pets.intruder_closing = 0U;
+                stall_confirm = 0U;
                 Lid_Stop_Motion(2); /* 2 = Timeout */
                 if (g_diag.lid_state == LID_OPENING) {
                     if (factory_reset_cycle_pending) {
@@ -1062,34 +1145,45 @@ int main(void)
                         Lid_Start_Closing();
                     } else {
                         g_diag.lid_state = g_diag.target_open_mode;
+                        ir_last_blocked_time = HAL_GetTick();
+                        recheck_next_at = ir_last_blocked_time + 5000U;
                     }
                 } else {
                     g_diag.lid_state = LID_CLOSED;
                 }
-            } else if (run_duration > 200) {
-                /* After 200ms inrush blanking, monitor PC4 rail sag */
+            } else if (run_duration > 200 && pc4_valid) {
+                /* After 200ms inrush blanking, monitor loaded-ON PC4 rail sag */
                 if (pc4 > motor_peak_pc4) {
                     motor_peak_pc4 = pc4;
-                }
+                    stall_confirm = 0U;
+                } else if ((motor_peak_pc4 >= 3450) && ((motor_peak_pc4 - pc4) >= g_stall_sag_threshold)) {
+                    if (++stall_confirm >= 2U) {
+                        /* Mechanical end-stop or obstruction reached! Cut motor immediately */
+                        Log_Event(5, 14, (uint32_t)(motor_peak_pc4 - pc4), run_duration);
+                        motor_partial_close_ms = 0U;
+                        g_pets.intruder_closing = 0U;
+                        stall_confirm = 0U;
+                        Lid_Stop_Motion(1); /* 1 = Stall cutoff */
 
-                if ((motor_peak_pc4 >= 3450) && ((motor_peak_pc4 - pc4) >= g_stall_sag_threshold)) {
-                    /* Mechanical end-stop reached! Cut motor immediately */
-                    Log_Event(5, 14, (uint32_t)(motor_peak_pc4 - pc4), run_duration);
-                    motor_partial_close_ms = 0U;
-                    Lid_Stop_Motion(1); /* 1 = Stall cutoff */
-
-                    if (g_diag.lid_state == LID_OPENING) {
-                        if (factory_reset_cycle_pending) {
-                            factory_reset_cycle_pending = 0U;
-                            Lid_Start_Closing();
+                        if (g_diag.lid_state == LID_OPENING) {
+                            if (factory_reset_cycle_pending) {
+                                factory_reset_cycle_pending = 0U;
+                                Lid_Start_Closing();
+                            } else {
+                                g_diag.lid_state = g_diag.target_open_mode;
+                                ir_last_blocked_time = HAL_GetTick();
+                                recheck_next_at = ir_last_blocked_time + 5000U;
+                            }
                         } else {
-                            g_diag.lid_state = g_diag.target_open_mode;
+                            g_diag.lid_state = LID_CLOSED;
                         }
-                    } else {
-                        g_diag.lid_state = LID_CLOSED;
                     }
+                } else {
+                    stall_confirm = 0U;
                 }
             }
+        } else {
+            stall_confirm = 0U;
         }
 
         /* --- 8. Status LED Indication (Official SureFeed Manual Behavior) --- */
@@ -1221,15 +1315,21 @@ void Lid_Start_Opening(LidState target_mode)
     Log_Event(6, 1, target_mode, g_diag.motor_speed_pct);
 }
 
-void Lid_Start_Closing(void)
+void Lid_Start_Closing_Duty(uint32_t duty_pct)
 {
     g_diag.lid_state = LID_CLOSING;
     motor_start_time = HAL_GetTick();
     motor_peak_pc4 = 0;
     last_run_log_time = motor_start_time;
-    Motor_Drive(MOTOR_CLOSE, g_diag.motor_speed_pct);
+    Motor_Drive(MOTOR_CLOSE, duty_pct);
     g_diag.motor_state = MOTOR_CLOSE;
-    Log_Event(6, 2, 0, g_diag.motor_speed_pct);
+    Log_Event(6, 2, g_pets.intruder_closing, duty_pct);
+}
+
+void Lid_Start_Closing(void)
+{
+    g_pets.intruder_closing = 0U;
+    Lid_Start_Closing_Duty(g_diag.motor_speed_pct);
 }
 
 void Lid_Stop_Motion(uint32_t stop_reason)
@@ -2922,7 +3022,6 @@ void SysTick_Handler(void)
     HAL_IncTick();
 
     s_motor_pwm_counter++;
-    uint32_t step = s_motor_pwm_counter % 4; /* 250 Hz cycle (4 x 1ms) */
 
     if (s_target_motor_dir == MOTOR_STOP) {
         GPIOE->BSRR = ((uint32_t)GPIO_PIN_11 << 16U) | ((uint32_t)GPIO_PIN_12 << 16U);
@@ -2938,11 +3037,18 @@ void SysTick_Handler(void)
         return;
     }
 
-    /* 75% duty: 3 ms ON, 1 ms OFF */
-    /* 50% duty: 2 ms ON, 2 ms OFF */
-    uint32_t on_steps = (s_target_duty_pct >= 70) ? 3 : 2;
+    uint8_t on_now;
+    if (s_target_duty_pct <= 40U) {
+        /* ~1/3 speed (33.3% duty @ 333 Hz): 1 ms ON, 2 ms OFF */
+        on_now = ((s_motor_pwm_counter % 3U) == 0U) ? 1U : 0U;
+    } else {
+        /* 75% duty (3/4 ms @ 250 Hz) or 50% duty (2/4 ms @ 250 Hz) */
+        uint32_t step = s_motor_pwm_counter % 4U;
+        uint32_t on_steps = (s_target_duty_pct >= 70U) ? 3U : 2U;
+        on_now = (step < on_steps) ? 1U : 0U;
+    }
 
-    if (step < on_steps) {
+    if (on_now) {
         if (s_target_motor_dir == MOTOR_OPEN) {
             GPIOE->BSRR = ((uint32_t)GPIO_PIN_12 << 16U) | GPIO_PIN_11;
         } else if (s_target_motor_dir == MOTOR_CLOSE) {
