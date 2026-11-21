@@ -42,7 +42,7 @@ See **[`HARDWARE.md`](HARDWARE.md)** for the complete reverse-engineering refere
 
 ## Quick Install (Pre-Built Release Binaries)
 
-You do **not** need to clone or build the project if you only want to flash the ready-made firmware. Download the pre-built files directly from the [`release/`](release/) folder:
+You do **not** need to clone or build the project if you only want to flash the ready-made firmware. Download the pre-built files from **[GitHub Releases](https://github.com/braunixy/SureFeed/releases/latest)** or directly from the [`release/`](release/) folder:
 
 | File | Format | Use With |
 | :--- | :--- | :--- |
