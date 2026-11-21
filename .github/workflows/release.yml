@@ -37,8 +37,7 @@ jobs:
           mkdir -p dist
           cp .pio/build/release/firmware.bin dist/surefeed-firmware.bin
           cp .pio/build/release/firmware.elf dist/surefeed-firmware.elf
-          OBJCOPY="$(find "$HOME/.platformio/packages" -name 'arm-none-eabi-objcopy' -type f | head -n 1)"
-          "$OBJCOPY" -O ihex .pio/build/release/firmware.elf dist/surefeed-firmware.hex
+          pio pkg exec -p toolchain-gccarmnoneeabi -- arm-none-eabi-objcopy -O ihex .pio/build/release/firmware.elf dist/surefeed-firmware.hex
           (cd dist && sha256sum surefeed-firmware.bin surefeed-firmware.elf surefeed-firmware.hex > SHA256SUMS.txt)
           cat dist/SHA256SUMS.txt
 
