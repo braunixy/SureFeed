@@ -391,6 +391,10 @@ typedef struct {
     uint32_t recheck_auth_count;             /* Rechecks confirming an authorized pet */
     uint32_t intruder_close_count;           /* Slow closes triggered by wrong-pet detection */
     uint32_t intruder_closing;               /* 1 while slow (33%) intruder close is active */
+    uint32_t vdd_mv;                         /* Regulated MCU VDD via VREFINT (mV, 3300 nom) */
+    uint32_t vbat_load_mv;                   /* Estimated loaded battery voltage via PC4 (mV) */
+    uint16_t pc4_peak_counts;                /* Last normal-speed motor free-travel PC4 peak */
+    uint8_t  low_battery;                    /* 1 when low battery warning is active */
     uint32_t ir_online;                      /* 1 once unobstructed IR beam is detected */
     uint32_t clear_req;                      /* Set to 1 in GDB to wipe learned pets */
 } PetRegistry;
@@ -404,6 +408,7 @@ static void Pets_Save_To_EEPROM(void);
 static uint8_t Pets_Is_Authorized(uint64_t id64);
 static void Pets_Add(uint64_t id64);
 static void Format_ISO_Buf(volatile char *dst, uint64_t id64);
+static void Battery_Check_Update(uint16_t loaded_pc4);
 
 typedef struct {
     uint8_t  hserdy;
@@ -688,9 +693,10 @@ int main(void)
     TIM21->EGR = TIM_EGR_UG;
     TIM21->CR1 = TIM_CR1_CEN;
 
-    /* Load learned pets from Data EEPROM and start in low-power idle (RFID OFF) */
+    /* Load learned pets from Data EEPROM, check initial supply voltage, and start in low-power idle */
     Pets_Load_From_EEPROM();
     RFID_Power_Down();
+    Battery_Check_Update(0U);
 
     uint32_t learn_baseline_crc_ok = 0U;
     uint32_t learn_success_until = 0U;
@@ -704,6 +710,7 @@ int main(void)
     uint32_t ir_last_blocked_time = 0U;
     uint32_t recheck_next_at = 0U;
     uint32_t recheck_active_until = 0U;
+    uint32_t next_vbat_check_at = HAL_GetTick() + 30000U;
     uint8_t  recheck_saw_auth = 0U;
     uint8_t  recheck_saw_unauth = 0U;
     uint8_t  stall_confirm = 0U;
@@ -1135,10 +1142,14 @@ int main(void)
                 Lid_Stop_Motion(0);
                 g_diag.lid_state = LID_CLOSED;
             } else if (run_duration >= timeout_ms) {
+                uint16_t peak_snap = motor_peak_pc4;
                 motor_partial_close_ms = 0U;
                 g_pets.intruder_closing = 0U;
                 stall_confirm = 0U;
                 Lid_Stop_Motion(2); /* 2 = Timeout */
+                if (s_target_duty_pct >= 70U && peak_snap >= 1200U) {
+                    Battery_Check_Update(peak_snap);
+                }
                 if (g_diag.lid_state == LID_OPENING) {
                     if (factory_reset_cycle_pending) {
                         factory_reset_cycle_pending = 0U;
@@ -1156,14 +1167,19 @@ int main(void)
                 if (pc4 > motor_peak_pc4) {
                     motor_peak_pc4 = pc4;
                     stall_confirm = 0U;
-                } else if ((motor_peak_pc4 >= 3450) && ((motor_peak_pc4 - pc4) >= g_stall_sag_threshold)) {
+                } else if ((motor_peak_pc4 >= 1200U) && ((motor_peak_pc4 - pc4) >= g_stall_sag_threshold)) {
                     if (++stall_confirm >= 2U) {
                         /* Mechanical end-stop or obstruction reached! Cut motor immediately */
+                        uint16_t peak_snap = motor_peak_pc4;
+                        uint32_t duty_snap = s_target_duty_pct;
                         Log_Event(5, 14, (uint32_t)(motor_peak_pc4 - pc4), run_duration);
                         motor_partial_close_ms = 0U;
                         g_pets.intruder_closing = 0U;
                         stall_confirm = 0U;
                         Lid_Stop_Motion(1); /* 1 = Stall cutoff */
+                        if (duty_snap >= 70U && peak_snap >= 1200U) {
+                            Battery_Check_Update(peak_snap);
+                        }
 
                         if (g_diag.lid_state == LID_OPENING) {
                             if (factory_reset_cycle_pending) {
@@ -1184,6 +1200,10 @@ int main(void)
             }
         } else {
             stall_confirm = 0U;
+            if ((int32_t)(now - next_vbat_check_at) >= 0) {
+                next_vbat_check_at = now + 30000U;
+                Battery_Check_Update(0U);
+            }
         }
 
         /* --- 8. Status LED Indication (Official SureFeed Manual Behavior) --- */
@@ -1252,6 +1272,14 @@ int main(void)
             /* IR beam broken -> RFID Antenna Scanning: Flashing GREEN */
             if ((now / 150U) % 2U) LED_GREEN_ON(); else LED_GREEN_OFF();
             LED_RED_OFF();
+        } else if (g_pets.low_battery) {
+            /* Official Low Battery Warning: brief RED flash every 4.0s at idle */
+            if ((now % 4000U) < 150U) {
+                LED_RED_ON();
+            } else {
+                LED_RED_OFF();
+            }
+            LED_GREEN_OFF();
         } else {
             /* Official Idle State (RFID TX & RX OFF): LED completely OFF */
             LED_GREEN_OFF();
@@ -2006,6 +2034,70 @@ static void Pets_Add(uint64_t id64)
         Pets_Save_To_EEPROM();
     }
     g_pets.last_authorized = 1U;
+}
+
+static void Battery_Check_Update(uint16_t loaded_pc4)
+{
+    static uint8_t s_low_streak = 0U;
+
+    if ((ADC1->CR & ADC_CR_ADEN) == 0U) {
+        ADC1->ISR = ADC_ISR_ADRDY;
+        ADC1->CR |= ADC_CR_ADEN;
+        while ((ADC1->ISR & ADC_ISR_ADRDY) == 0U) {}
+    }
+
+    ADC1_COMMON->CCR |= ADC_CCR_VREFEN;
+    uint16_t tw = (uint16_t)TIM21->CNT;
+    while ((uint16_t)((uint16_t)TIM21->CNT - tw) < 30U) {}
+
+    ADC1->SMPR = ADC_SAMPLETIME_160CYCLES_5;
+    ADC1->CHSELR = ADC_CHSELR_CHSEL17;
+
+    /* Discard 1st conversion, then average 8 VREFINT readings */
+    uint32_t sum = 0U;
+    for (int i = 0; i < 9; i++) {
+        ADC1->CR |= ADC_CR_ADSTART;
+        while ((ADC1->ISR & ADC_ISR_EOC) == 0U) {}
+        uint16_t v = (uint16_t)ADC1->DR;
+        if (i > 0) sum += v;
+    }
+
+    ADC1->CHSELR = 0U;
+    ADC1_COMMON->CCR &= ~ADC_CCR_VREFEN;
+    HAL_ADC_Stop(&hadc);
+
+    uint32_t vref_avg = sum >> 3U;
+    uint16_t cal = *(const volatile uint16_t *)0x1FF80078U; /* VREFINT_CAL @ 3.000V */
+    if (vref_avg > 0U && cal > 0U) {
+        g_pets.vdd_mv = ((uint32_t)cal * 3000U) / vref_avg;
+    }
+    if (g_pets.vdd_mv == 0U) {
+        g_pets.vdd_mv = 3300U;
+    }
+
+    if (loaded_pc4 >= 1200U) {
+        g_pets.pc4_peak_counts = loaded_pc4;
+        uint32_t pc4_mv = ((uint32_t)loaded_pc4 * g_pets.vdd_mv) / 4095U;
+        g_pets.vbat_load_mv = (pc4_mv * 2100U) / 1000U;
+    }
+
+    uint8_t is_low = (g_pets.vdd_mv < 3150U ||
+                      (g_pets.vbat_load_mv > 0U && g_pets.vbat_load_mv < 4500U)) ? 1U : 0U;
+    uint8_t is_severe = (g_pets.vdd_mv < 3000U ||
+                         (g_pets.vbat_load_mv > 0U && g_pets.vbat_load_mv < 4000U)) ? 1U : 0U;
+    uint8_t is_healthy = (g_pets.vdd_mv >= 3220U &&
+                          (g_pets.vbat_load_mv == 0U || g_pets.vbat_load_mv >= 4800U)) ? 1U : 0U;
+
+    if (is_severe) {
+        s_low_streak = 2U;
+        g_pets.low_battery = 1U;
+    } else if (is_low) {
+        if (s_low_streak < 4U) s_low_streak++;
+        if (s_low_streak >= 2U) g_pets.low_battery = 1U;
+    } else if (is_healthy) {
+        s_low_streak = 0U;
+        g_pets.low_battery = 0U;
+    }
 }
 
 static void FDXB_Capture_And_Decode(uint32_t ch)
