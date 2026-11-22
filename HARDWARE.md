@@ -76,6 +76,22 @@ The status LED is a dual-die bi-color LED located on the button daughterboard:
 * **Red:** Driven by **`PA15`** (**Active LOW**: Drive **LOW / 0V** to turn ON, **HIGH / 3.3V** to turn OFF).
 * **Orange / Amber:** Achieved by driving **`PC10` LOW** and **`PA15` LOW** simultaneously.
 
+#### Firmware Status LED Priority & Pattern Table (`src/main.c`)
+| Priority | Pattern | Timing / Duration | Meaning |
+| :---: | :--- | :--- | :--- |
+| `1` | **Alternating Red / Green** | `150 ms` swap for `3.0 s` | **Factory reset** (`SW1` held $\ge 10\text{ s}$; wipes Data EEPROM & cycles lid). |
+| `2` | **Solid Green** | `1.5 s` pulse | **Microchip learned** or **authorized chip read** confirmation. |
+| `3` | **Fast-Flashing Red** | `120 ms` toggle for `1.0 s` | **Unauthorized chip** detected (denied open or intruder slow close triggered). |
+| `4` | **Solid Orange / Amber** | `500 ms` pulse | **Motor stall cutoff** (mechanical end-stop or obstruction detected on `PC4`). |
+| `5` | **Green / Orange / Red** | `1.0 s` after slider change | **Close delay slider confirmation** (`I = 3.5 s` Green, `II = 6.0 s` Orange, `III = 10.0 s` Red). |
+| `6` | **Slow-Flashing Green** | `1 Hz` (`500 ms` on/off) | **Add Pet / Learn mode** active (`SW1` pressed; waiting for microchip). |
+| `7` | **Solid Green** | Continuous while open | **Authorized pet eating** (`LID_OPEN_AUTO`, Training Stage $\ne 1$). |
+| `8` | **Flashing Orange ($1\times\text{--}4\times$)** | $1\text{--}4$ pulses per `2.4 s` cycle | **Training Mode** stage $1\text{--}4$ active (`SW3`). |
+| `9` | **Solid Red** | Continuous while open | **Manual hold open** (`LID_OPEN_MANUAL` via `SW2`; auto mode paused). |
+| `10` | **Fast-Flashing Green** | `120 ms` toggle (`~4.2 Hz`) | **RFID scanning:** IR beam broken; antenna powered up reading microchip. |
+| `11` | **Brief Red Flash** | `150 ms` pulse every `4.0 s` | **Low battery warning** at idle (`VDD < 3.15 V` or loaded pack `< 4.50 V`). |
+| `12` | **OFF** | Continuous | **Idle standby** (lid closed, RFID TX & RX powered down). |
+
 ### 3.2 User Buttons & Slider Switch
 The user controls on the daughterboard connect via a 5-pin ribbon cable:
 * **Pinout of Daughterboard Connector (Conn1):**
@@ -107,10 +123,10 @@ The user controls on the daughterboard connect via a 5-pin ribbon cable:
   * The feeder has **NO mechanical limit switches, optical interrupters, or rotary encoders** on the lid or gearbox.
   * It employs dynamic **Supply Rail Voltage-Sag Stall Detection** via **`PC4` (`ADC_IN14`, Pin 33)**:
     1. **Idle State:** Motor OFF $\rightarrow$ `PC4` reads $0\text{V}$ ($15\text{ ADC counts}$).
-    2. **Startup Blanking:** During the first $200\text{ ms}$, inrush motor starting current is blanked out.
-    3. **Free Travel:** While the lid is moving freely, the motor draws $\sim 100\text{ mA}$, holding `PC4` at $\sim 2.86\text{V}$ ($3550 \pm 20\text{ ADC counts}$).
-    4. **Mechanical End-Stop (Stall):** When the lid reaches fully open or fully closed, the motor stalls and current jumps to $\sim 1.0\text{ A}$. The battery/inductor internal resistance causes the supply rail to immediately plunge to $\sim 2.72\text{V}$ ($3385\text{ counts}$ — a sharp $\sim 175\text{ count}$ sag).
-    5. **Automated Cutoff:** Calibrated with a `90 count` threshold ($\sim 75\text{ mV}$ sag). Cutoff triggers within milliseconds of contacting the end-stop, instantly cutting H-bridge drive and lighting solid Amber LED feedback.
+    2. **Startup Blanking:** During the first $350\text{ ms}$, inrush motor starting current is blanked out while the median-of-3 EMA filter (`s_motor_pc4_filt`) settles on PWM ON phases (`g_motor_settled_on = 1`, rejecting `< 4090` switching spikes and skipping OFF/turn-on edges).
+    3. **Free Travel:** While the lid is moving freely (`75%` PWM @ $125\text{ Hz}$, $6\text{ ms}$ ON / $2\text{ ms}$ OFF), the motor holds `PC4` at $\sim 2.86\text{V}$ ($3550\text{--}3605\text{ ADC counts}$).
+    4. **Mechanical End-Stop (Stall):** When the lid reaches fully open or fully closed, the motor stalls and current jumps to $\sim 1.0\text{ A}$. The battery/inductor internal resistance causes the supply rail to immediately drop by $120\text{--}175\text{ counts}$ ($\sim 2.72\text{V}$).
+    5. **Automated Cutoff:** Calibrated with a `110 count` sag threshold (`g_stall_sag_threshold`) across $4$ consecutive filtered confirmations spaced $\ge 4\text{ ms}$ apart ($\ge 16\text{ ms}$ sustained stall), cutting H-bridge drive cleanly and lighting solid Amber LED feedback for $500\text{ ms}$.
 
 ### 3.4 IR Pet Arch Emitter (100% Reverse Engineered & Verified)
 * **Emitter Circuit Topology:** Common-Anode Capacitor-Discharge Switched 940nm Dual IR LEDs:
@@ -242,16 +258,16 @@ The user controls on the daughterboard connect via a 5-pin ribbon cable:
 | **Open / Close Button (`SW2`, `BTN_OPEN_CLOSE`)** | Opens the lid manually for refilling/cleaning bowls; pressing again closes the lid and resumes normal automatic operation. | Opens lid manually (`LID_OPEN_MANUAL`, pausing auto mode); pressing again closes lid and resumes `auto_mode_active = 1`. | **Exact Match** |
 | **Idle & Active LEDs** | • **Idle:** LED completely **OFF**.<br>• **Add Pet Mode:** **Flashing Green** ($1\text{ Hz}$).<br>• **Eating / Read:** **Solid Green**.<br>• **Training Mode:** **Flashing Orange** ($1\times\text{--}4\times$).<br>• **Factory Reset:** **Alternating Red / Green**.<br>• **Low Battery:** **Flashing Red** every few seconds. | • **Idle:** LED completely **OFF**.<br>• **Add Pet Mode:** **Flashing Green** ($1\text{ Hz}$).<br>• **Eating / Read:** **Solid Green**.<br>• **Training Mode:** **Flashing Orange** ($1\times\text{--}4\times$).<br>• **Factory Reset:** **Alternating Red / Green**.<br>• **Low Battery:** **Flashing Red** ($150\text{ ms}$ pulse every $4.0\text{ s}$ at idle). | **Exact Match** |
 | **Low-Battery Detection (`VREFINT` + `PC4`)** | Flashing red LED when batteries near depletion. | • **Idle Rail Check (every $30\text{ s}$):** Enables internal `VREFINT` (`ADC_CHANNEL_17`) calibrated against `VREFINT_CAL` (`0x1FF80078`) for $0\ \mu\text{A}$-standby `VDD` measurement (low if $< 3.15\text{ V}$).<br>• **Loaded Motor Check:** Evaluates `PC4` free-travel peak (`vbat_load_mv ≈ pc4_mv * 2.1`) on normal open/close moves (low if $< 4.50\text{ V}$ under load; latch clears at $\ge 4.80\text{ V}$). | **Exact Match** |
-| **5s Anti-Hijack Guard & Slow Intruder Close** | Stock firmware trusts the initial opening tag for as long as the IR beam stays broken (vulnerable to a second unauthorized pet pushing the first pet aside while the lid is open). | While `LID_OPEN_AUTO` and `ir_blocked == 1` (`training_stage != 1`):<br>1. Wakes RFID every **$5.0\text{ s}$** for up to **$1.5\text{ s}$** (`recheck_count`).<br>2. If an **authorized** pet tag is read, immediately powers down RFID and stays open (`recheck_auth_count++`).<br>3. If **only** an **unauthorized** tag is read across the window (`recheck_saw_unauth && !recheck_saw_auth`), closes the lid gently at **$33\%$ PWM speed** (`1 ms ON / 2 ms OFF` @ $333\text{ Hz}$, `Lid_Start_Closing_Duty(33)`) without IR-reopen bounce and with active ON-phase `PC4` stall protection (`intruder_close_count++`).<br>4. If **no** tag is read, stays open safely and rechecks again in $5\text{ s}$. | **Custom Enhancement** |
+| **5s Anti-Hijack Guard & Slow Intruder Close** | Stock firmware trusts the initial opening tag for as long as the IR beam stays broken (vulnerable to a second unauthorized pet pushing the first pet aside while the lid is open). | While `LID_OPEN_AUTO` and `ir_blocked == 1` (`training_stage != 1`):<br>1. Wakes RFID every **$5.0\text{ s}$** for up to **$1.5\text{ s}$** (`recheck_count`).<br>2. If an **authorized** pet tag is read, immediately powers down RFID and stays open (`recheck_auth_count++`).<br>3. If **only** an **unauthorized** tag is read across the window (`recheck_saw_unauth && !recheck_saw_auth`), closes the lid gently at **$33\%$ PWM speed** (`4 ms ON / 8 ms OFF` @ $83\text{ Hz}$, `Lid_Start_Closing_Duty(33)`) without IR-reopen bounce and with active settled-ON `PC4` stall protection (`intruder_close_count++`).<br>4. If **no** tag is read, stays open safely and rechecks again in $5\text{ s}$. | **Custom Enhancement** |
 
 ### 4.1 Custom Anti-Hijack Feature Details (5-Second Guard & One-Third Speed Close)
 1. **Why a `1.5 s` Recheck Window When an Intruder Is Seen:**
    * Immediately terminating the scan on a single unauthorized frame could false-trigger if an authorized cat stepped slightly aside momentarily before stepping back in. As soon as any learned ID is decoded (`Pets_Is_Authorized`), the recheck succeeds early and cuts TX power (`RFID_Power_Down()`); it only triggers `intruder_closing` if the full $1.5\text{ s}$ scan window sees **only** an unauthorized microchip (`recheck_saw_unauth && !recheck_saw_auth`).
    * If no microchip is detected (e.g., authorized pet leaning far forward into the bowl out of coil coupling range), the lid remains open and schedules another check $5.0\text{ s}$ later.
 2. **Gentle $1/3$ Speed Motor Drive (`SysTick_Handler` & `Lid_Start_Closing_Duty(33)`):**
-   * Normal lid motions run at `75%` PWM duty ($3\text{ ms}$ ON / $1\text{ ms}$ OFF at $250\text{ Hz}$).
-   * Intruder close drives `PE12` at **`33.3%` PWM duty** ($1\text{ ms}$ ON / $2\text{ ms}$ OFF at $333\text{ Hz}$) with an extended $8.0\text{ s}$ timeout so the slower travel comfortably completes full stroke, allowing an intruding pet to back out safely without pinching or jamming.
-   * During `intruder_closing`, normal IR break-beam auto-reopen is suppressed (since the intruder is actively breaking the beam), while **ON-phase-synchronized `PC4` rail-sag sensing** (`GPIOE->ODR` verified active before & after ADC conversion across $2$ consecutive samples) still cuts power immediately if the lid physically stalls against an obstacle or reaches the closed end-stop. Pressing `BTN_OPEN_CLOSE` manually still interrupts immediately at any time.
+   * Normal lid motions run at `75%` PWM duty ($6\text{ ms}$ ON / $2\text{ ms}$ OFF at $125\text{ Hz}$).
+   * Intruder close drives `PE12` at **`33.3%` PWM duty** ($4\text{ ms}$ ON / $8\text{ ms}$ OFF at $83\text{ Hz}$) with an extended $8.0\text{ s}$ timeout so the slower travel comfortably completes full stroke, allowing an intruding pet to back out safely without pinching or jamming.
+   * During `intruder_closing`, normal IR break-beam auto-reopen is suppressed (since the intruder is actively breaking the beam), while **settled-ON `PC4` rail-sag sensing** (`GPIOE->ODR` active & `g_motor_settled_on == 1`, median-of-3 + EMA filter across $4$ confirmations) still cuts power immediately if the lid physically stalls against an obstacle or reaches the closed end-stop. Pressing `BTN_OPEN_CLOSE` manually still interrupts immediately at any time.
 
 ### 4.2 Low-Battery Detection Architecture (`VREFINT` + `PC4` Load Monitor)
 * **Zero-Standby Idle Voltage Sensing (`VREFINT`):** Every $30\text{ s}$ while the motor is idle (`Battery_Check_Update(0)`), firmware briefly enables `ADC_CCR_VREFEN`, averages 8 samples on internal `ADC_CHANNEL_17`, and immediately disables `VREFEN` for zero continuous draw. Comparing against factory silicon calibration `VREFINT_CAL` (`0x1FF80078` @ $3.000\text{ V}$) yields exact `VDD` (`g_pets.vdd_mv`), catching LDO dropout if cells collapse below $\sim 3.5\text{ V}$ (`vdd_mv < 3150 mV`).

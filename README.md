@@ -17,8 +17,8 @@ Custom, fully open-source STM32 firmware and complete PCB reverse-engineering do
 - **Power-Gated Arch Scanning:** Keeps both the RFID TX carrier and `700`-series `TL974I` op-amp RX chain completely powered down (`PB11 = LOW`) until the pulsed 940 nm IR break-beam detects a pet in the hoop.
 - **5-Second Anti-Hijack Guard & Gentle Slow Close *(Custom Enhancement)*:**
   - While the lid is open for an authorized pet and the IR beam stays broken, firmware re-wakes RFID every **`5.0 s`** for up to **`1.5 s`** to verify the pet currently in the arch is still authorized.
-  - If **only** an unauthorized microchip is detected across the window, the lid closes gently at **`1/3` speed (`33.3%` PWM duty, `1 ms ON / 2 ms OFF` @ `333 Hz`)** without IR auto-reopen bounce so the intruding pet can back out safely without getting pinched or trapped.
-  - Uses ON-phase-synchronized `PC4` rail-sag monitoring to cut power immediately if a physical obstacle or mechanical end-stop is hit.
+  - If **only** an unauthorized microchip is detected across the window, the lid closes gently at **`1/3` speed (`33.3%` PWM duty, `4 ms ON / 8 ms OFF` @ `83 Hz`)** without IR auto-reopen bounce so the intruding pet can back out safely without getting pinched or trapped.
+  - Uses settled ON-phase `PC4` rail-sag filtering (`350 ms` blanking, median-of-3 + EMA, `4`-sample confirm) to cut power immediately if a physical obstacle or mechanical end-stop is hit.
 - **Dual-Stage Low-Battery Detection:** Monitors both regulated MCU `VDD` via internal `VREFINT` (`0 µA` standby, sampled every `30 s`) and loaded battery pack voltage via `PC4` during lid travel, flashing red every `4.0 s` when batteries near depletion.
 - **Full Stock Control & Mode Parity:**
   - **Add Pet (`SW1`):** Opens lid, flashes green (`1 Hz`), learns tag, turns solid green, then closes once the pet steps away.
@@ -132,7 +132,22 @@ Factory boards ship with **RDP Level 1** and a **hardware-enforced Independent W
 | **Open / Close (`SW2`)** | Manually opens the lid (pauses auto mode) or closes it (resumes auto mode). |
 | **Training (`SW3`)** | Cycles through Training Stages `1 → 2 → 3 → 4 → Exit (0)` (`1×–4×` orange blinks). |
 | **Bottom Slider (`I / II / III`)** | Sets auto-close delay after pet leaves IR arch: `I = 3.5 s`, `II = 6.0 s`, `III = 10.0 s`. |
-| **Status LED** | **Off:** Idle · **Green 1 Hz:** Add Pet · **Solid Green:** Pet recognized / eating · **Orange `1×–4×`:** Training stage · **Fast Red:** Wrong pet detected / closing at `1/3` speed · **Brief Red (`4 s`):** Low battery · **Alt Red/Green:** Factory reset |
+
+### LED Patterns Quick Reference
+
+| LED Pattern | Timing / Duration | Meaning |
+| :--- | :--- | :--- |
+| **Off** | Continuous | Idle standby (lid closed, RFID TX & RX powered down). |
+| **Brief Red Flash** | `150 ms` pulse every `4.0 s` | **Low battery warning** at idle (`VDD < 3.15 V` or loaded pack `< 4.50 V`). |
+| **Fast-Flashing Green** | `~4.2 Hz` (`120 ms` toggle) | **Scanning:** IR break-beam triggered; RFID antenna actively searching for a microchip. |
+| **Slow-Flashing Green** | `1 Hz` (`500 ms` on/off) | **Add Pet mode:** Waiting to read and save a new pet microchip. |
+| **Solid Green** | While open / `1.5 s` on learn | **Authorized pet eating** (auto-open) or **microchip learned** confirmation. |
+| **Fast-Flashing Red** | `~4.2 Hz` (`120 ms` toggle, `1.0 s`) | **Unauthorized chip** detected (open denied, or intruder slow `1/3`-speed close triggered). |
+| **Solid Red** | Continuous while open | **Manual hold open** (`SW2` pressed; automatic IR/RFID control paused until pressed again). |
+| **Flashing Orange (`1×–4×`)** | `1–4` pulses per `2.4 s` cycle | **Training mode** active (pulse count = current training stage `1–4`). |
+| **Solid Orange / Amber** | `500 ms` on motor stop | **End-stop / stall cutoff:** Lid reached full travel limit or encountered an obstacle. |
+| **Slider Position Feedback** | `1.0 s` after moving slider | Close delay confirmation: **Green** = Pos `I` (`3.5 s`), **Orange** = Pos `II` (`6.0 s`), **Red** = Pos `III` (`10.0 s`). |
+| **Alternating Red / Green** | `150 ms` toggle for `3.0 s` | **Factory reset** activated (`SW1` held `10 s`; all stored microchips erased). |
 
 ---
 

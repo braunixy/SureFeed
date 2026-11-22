@@ -132,8 +132,12 @@ volatile DiagnosticLog g_diag = {
  * - g_stall_sag_threshold: rail sag on PC4 in ADC counts (90 counts ≈ 75mV)
  *   When motor stalls, rail drops by ~175 counts.
  */
-volatile uint16_t g_stall_sag_threshold = 90;
+volatile uint16_t g_stall_sag_threshold = 110;
 volatile uint16_t g_stall_threshold = 4096;
+volatile uint8_t  g_motor_settled_on = 0;
+volatile uint8_t  g_led_systick_blink = 0; /* 0=main loop, 1=Add Pet 1Hz green, 2=RFID scan ~4Hz green */
+static   uint16_t s_motor_pc4_filt = 0;
+static   uint8_t  s_stall_confirm = 0;
 
 typedef struct {
     uint32_t tx_enable;         /* 1 = 134.2 kHz TIM2_CH1 PWM active on PE9 */
@@ -548,6 +552,7 @@ static void Capture_Single_Channel_Pulse(uint32_t channel, uint16_t led_pin, vol
         hadc.Instance->CR |= ADC_CR_ADEN;
         while ((hadc.Instance->ISR & ADC_ISR_ADRDY) == 0) __NOP();
     }
+    ADC1->SMPR = ADC_SAMPLETIME_160CYCLES_5;
     hadc.Instance->CHSELR = (1UL << channel);
 
     /* Warmup 2 dummy reads so S&H cap is settled on this channel */
@@ -594,6 +599,12 @@ static int16_t Eval_Matched_Pulse(volatile uint16_t *dst)
 
 static void __attribute__((unused)) IR_Sample_Pulsed(void)
 {
+    /* Ensure 134.2 kHz RFID TX carrier is quiet before sampling high-Z phototransistors PB0/PB1 */
+    if (g_rfid.tx_enable || (TIM2->CR1 & TIM_CR1_CEN)) {
+        RFID_Carrier_Stop();
+        HAL_Delay(2);
+    }
+
     /* PC8 is Active-LOW: Drive LOW (0V) to enable high-side switch Q801 (powers NET 7 VCC_IR) */
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_RESET);
     g_diag.ir_rx_pc8 = 0;
@@ -713,7 +724,8 @@ int main(void)
     uint32_t next_vbat_check_at = HAL_GetTick() + 30000U;
     uint8_t  recheck_saw_auth = 0U;
     uint8_t  recheck_saw_unauth = 0U;
-    uint8_t  stall_confirm = 0U;
+    uint32_t last_stall_sample_ms = 0U;
+    uint32_t last_ir_during_rfid_ms = 0U;
     g_pets.close_delay_ms = 6000U;
 
     uint16_t prev_idr_A = (uint16_t)GPIOA->IDR;
@@ -980,11 +992,19 @@ int main(void)
 
         /* --- 5 & 6. IR Break-Beam Gate & Power-Gated RFID Antenna Control --- */
         if (g_diag.lid_state != LID_OPENING && g_diag.lid_state != LID_CLOSING) {
-            IR_Sample_Pulsed();
+            if (!s_rfid_powered || (now - last_ir_during_rfid_ms >= 200U)) {
+                last_ir_during_rfid_ms = now;
+                IR_Sample_Pulsed();
+            }
         }
 
         if (g_diag.add_pet_mode) {
             /* Official Add Pet Mode: lid stays open, LED flashes green 1Hz, antenna scans until chip is learned */
+            if (now >= factory_reset_led_until && now >= learn_success_until &&
+                now >= unauth_feedback_until && now >= stall_feedback_until &&
+                now >= slider_feedback_until) {
+                g_led_systick_blink = 1U;
+            }
             if (g_diag.lid_state != LID_OPENING && g_diag.lid_state != LID_CLOSING) {
                 RFID_Chip_Sweep();
             }
@@ -1079,6 +1099,11 @@ int main(void)
                                       (ir_rfid_active_until != 0U && (int32_t)(ir_rfid_active_until - now) > 0))) ? 1U : 0U;
 
                 if (want_rfid) {
+                    if (now >= factory_reset_led_until && now >= learn_success_until &&
+                        now >= unauth_feedback_until && now >= stall_feedback_until &&
+                        now >= slider_feedback_until && g_pets.training_stage == 0U) {
+                        g_led_systick_blink = 2U;
+                    }
                     uint32_t prev_crc = g_fdxb.crc_ok_count;
                     RFID_Chip_Sweep();
                     if (g_fdxb.crc_ok_count != prev_crc && g_fdxb.raw_id64 != 0ULL) {
@@ -1118,12 +1143,28 @@ int main(void)
         if (g_diag.lid_state == LID_OPENING || g_diag.lid_state == LID_CLOSING) {
             now = HAL_GetTick();
             uint32_t run_duration = (now >= motor_start_time) ? (now - motor_start_time) : 0;
+            uint8_t  settled_before = g_motor_settled_on;
             uint32_t pe_before = GPIOE->ODR & (GPIO_PIN_11 | GPIO_PIN_12);
-            uint16_t pc4 = ADC_Read_Fast(14);
+            uint16_t s0 = ADC_Read_Fast(14);
+            uint16_t s1 = ADC_Read_Fast(14);
+            uint16_t s2 = ADC_Read_Fast(14);
             uint32_t pe_after = GPIOE->ODR & (GPIO_PIN_11 | GPIO_PIN_12);
-            uint8_t  pc4_valid = (pe_before != 0U && pe_after == pe_before) ? 1U : 0U;
+            uint8_t  settled_after = g_motor_settled_on;
+
+            /* Median of 3 ADC reads to reject single-sample switching glitches */
+            uint16_t pc4_med;
+            if (s0 > s1) { uint16_t t = s0; s0 = s1; s1 = t; }
+            if (s1 > s2) { s1 = s2; }
+            pc4_med = (s0 > s1) ? s0 : s1;
+
+            uint8_t pc4_valid = (settled_before != 0U && settled_after != 0U &&
+                                 pe_before != 0U && pe_after == pe_before &&
+                                 pc4_med < 4090U) ? 1U : 0U;
             if (pc4_valid) {
-                g_diag.live_adc[14] = pc4;
+                s_motor_pc4_filt = (s_motor_pc4_filt == 0U)
+                                       ? pc4_med
+                                       : (uint16_t)((((uint32_t)s_motor_pc4_filt * 3U) + pc4_med) >> 2U);
+                g_diag.live_adc[14] = s_motor_pc4_filt;
             }
 
             /* Periodic diagnostic logging every 100ms during run */
@@ -1138,14 +1179,14 @@ int main(void)
             if (g_diag.lid_state == LID_CLOSING && motor_partial_close_ms > 0U && run_duration >= motor_partial_close_ms) {
                 motor_partial_close_ms = 0U;
                 g_pets.intruder_closing = 0U;
-                stall_confirm = 0U;
+                s_stall_confirm = 0U;
                 Lid_Stop_Motion(0);
                 g_diag.lid_state = LID_CLOSED;
             } else if (run_duration >= timeout_ms) {
                 uint16_t peak_snap = motor_peak_pc4;
                 motor_partial_close_ms = 0U;
                 g_pets.intruder_closing = 0U;
-                stall_confirm = 0U;
+                s_stall_confirm = 0U;
                 Lid_Stop_Motion(2); /* 2 = Timeout */
                 if (s_target_duty_pct >= 70U && peak_snap >= 1200U) {
                     Battery_Check_Update(peak_snap);
@@ -1162,20 +1203,22 @@ int main(void)
                 } else {
                     g_diag.lid_state = LID_CLOSED;
                 }
-            } else if (run_duration > 200 && pc4_valid) {
-                /* After 200ms inrush blanking, monitor loaded-ON PC4 rail sag */
+            } else if (run_duration > 350 && pc4_valid && (now - last_stall_sample_ms >= 4U)) {
+                /* After 350ms inrush blanking, monitor smoothed settled-ON PC4 rail sag */
+                last_stall_sample_ms = now;
+                uint16_t pc4 = s_motor_pc4_filt;
                 if (pc4 > motor_peak_pc4) {
                     motor_peak_pc4 = pc4;
-                    stall_confirm = 0U;
+                    s_stall_confirm = 0U;
                 } else if ((motor_peak_pc4 >= 1200U) && ((motor_peak_pc4 - pc4) >= g_stall_sag_threshold)) {
-                    if (++stall_confirm >= 2U) {
+                    if (++s_stall_confirm >= 4U) {
                         /* Mechanical end-stop or obstruction reached! Cut motor immediately */
                         uint16_t peak_snap = motor_peak_pc4;
                         uint32_t duty_snap = s_target_duty_pct;
                         Log_Event(5, 14, (uint32_t)(motor_peak_pc4 - pc4), run_duration);
                         motor_partial_close_ms = 0U;
                         g_pets.intruder_closing = 0U;
-                        stall_confirm = 0U;
+                        s_stall_confirm = 0U;
                         Lid_Stop_Motion(1); /* 1 = Stall cutoff */
                         if (duty_snap >= 70U && peak_snap >= 1200U) {
                             Battery_Check_Update(peak_snap);
@@ -1195,11 +1238,12 @@ int main(void)
                         }
                     }
                 } else {
-                    stall_confirm = 0U;
+                    s_stall_confirm = 0U;
                 }
             }
         } else {
-            stall_confirm = 0U;
+            s_stall_confirm = 0U;
+            s_motor_pc4_filt = 0U;
             if ((int32_t)(now - next_vbat_check_at) >= 0) {
                 next_vbat_check_at = now + 30000U;
                 Battery_Check_Update(0U);
@@ -1208,6 +1252,7 @@ int main(void)
 
         /* --- 8. Status LED Indication (Official SureFeed Manual Behavior) --- */
         if (now < factory_reset_led_until) {
+            g_led_systick_blink = 0U;
             /* Factory Reset: Alternating RED / GREEN */
             if ((now / 150U) % 2U) {
                 LED_RED_ON();
@@ -1217,18 +1262,22 @@ int main(void)
                 LED_GREEN_ON();
             }
         } else if (now < learn_success_until) {
+            g_led_systick_blink = 0U;
             /* Microchip Learned / Read: Solid GREEN */
             LED_RED_OFF();
             LED_GREEN_ON();
         } else if (now < unauth_feedback_until) {
+            g_led_systick_blink = 0U;
             /* Unauthorized Chip Feedback: Fast-Flashing RED (1.0s) */
             if ((now / 120U) % 2U) LED_RED_ON(); else LED_RED_OFF();
             LED_GREEN_OFF();
         } else if (now < stall_feedback_until) {
+            g_led_systick_blink = 0U;
             /* Stall Cutoff Feedback: Solid ORANGE / AMBER */
             LED_RED_ON();
             LED_GREEN_ON();
         } else if (now < slider_feedback_until) {
+            g_led_systick_blink = 0U;
             /* Slider switch feedback */
             if (slider_feedback_pos == 1) {
                 LED_RED_OFF();
@@ -1242,17 +1291,14 @@ int main(void)
             }
         } else if (g_diag.add_pet_mode) {
             /* Official Add Pet / Learn Mode: Flashing GREEN once per second (1 Hz) */
-            if ((now % 1000U) < 500U) {
-                LED_GREEN_ON();
-            } else {
-                LED_GREEN_OFF();
-            }
-            LED_RED_OFF();
+            g_led_systick_blink = 1U;
         } else if (g_diag.lid_state == LID_OPEN_AUTO && g_pets.training_stage != 1U) {
+            g_led_systick_blink = 0U;
             /* Authorized Pet Eating / Microchip Read: Solid GREEN */
             LED_RED_OFF();
             LED_GREEN_ON();
         } else if (g_pets.training_stage >= 1U && g_pets.training_stage <= 4U) {
+            g_led_systick_blink = 0U;
             /* Official Training Mode: Flashing ORANGE N times (1..4) per 2.4s cycle */
             uint32_t phase = now % 2400U;
             uint32_t pulse_idx = phase / 350U;
@@ -1265,14 +1311,15 @@ int main(void)
                 LED_GREEN_OFF();
             }
         } else if (g_diag.lid_state == LID_OPEN_MANUAL) {
+            g_led_systick_blink = 0U;
             /* Manual Hold Open: Solid RED (automatic mode paused) */
             LED_RED_ON();
             LED_GREEN_OFF();
         } else if (g_diag.rfid_scan_active) {
-            /* IR beam broken -> RFID Antenna Scanning: Flashing GREEN */
-            if ((now / 150U) % 2U) LED_GREEN_ON(); else LED_GREEN_OFF();
-            LED_RED_OFF();
+            /* IR beam broken -> RFID Antenna Scanning: Fast-Flashing GREEN (~4.2 Hz) */
+            g_led_systick_blink = 2U;
         } else if (g_pets.low_battery) {
+            g_led_systick_blink = 0U;
             /* Official Low Battery Warning: brief RED flash every 4.0s at idle */
             if ((now % 4000U) < 150U) {
                 LED_RED_ON();
@@ -1281,6 +1328,7 @@ int main(void)
             }
             LED_GREEN_OFF();
         } else {
+            g_led_systick_blink = 0U;
             /* Official Idle State (RFID TX & RX OFF): LED completely OFF */
             LED_GREEN_OFF();
             LED_RED_OFF();
@@ -1305,18 +1353,21 @@ void Motor_Drive(MotorDirection dir, uint32_t duty_pct)
 {
     if (dir == MOTOR_STOP) {
         s_target_motor_dir = MOTOR_STOP;
+        g_motor_settled_on = 0U;
         GPIOE->BSRR = ((uint32_t)GPIO_PIN_11 << 16U) | ((uint32_t)GPIO_PIN_12 << 16U);
         return;
     }
 
     if (dir != s_target_motor_dir) {
         s_target_motor_dir = MOTOR_STOP;
+        g_motor_settled_on = 0U;
         GPIOE->BSRR = ((uint32_t)GPIO_PIN_11 << 16U) | ((uint32_t)GPIO_PIN_12 << 16U);
         for (volatile int i = 0; i < 500; i++) __NOP(); /* Shoot-through dead-time */
     }
 
     s_target_duty_pct = duty_pct;
     s_target_motor_dir = dir;
+    g_motor_settled_on = (duty_pct >= 100U) ? 1U : 0U;
 
     /* Drive active direction pin immediately */
     if (dir == MOTOR_OPEN) {
@@ -1337,6 +1388,8 @@ void Lid_Start_Opening(LidState target_mode)
     g_diag.lid_state = LID_OPENING;
     motor_start_time = HAL_GetTick();
     motor_peak_pc4 = 0;
+    s_motor_pc4_filt = 0;
+    s_stall_confirm = 0;
     last_run_log_time = motor_start_time;
     Motor_Drive(MOTOR_OPEN, g_diag.motor_speed_pct);
     g_diag.motor_state = MOTOR_OPEN;
@@ -1348,6 +1401,8 @@ void Lid_Start_Closing_Duty(uint32_t duty_pct)
     g_diag.lid_state = LID_CLOSING;
     motor_start_time = HAL_GetTick();
     motor_peak_pc4 = 0;
+    s_motor_pc4_filt = 0;
+    s_stall_confirm = 0;
     last_run_log_time = motor_start_time;
     Motor_Drive(MOTOR_CLOSE, duty_pct);
     g_diag.motor_state = MOTOR_CLOSE;
@@ -1636,8 +1691,8 @@ void RFID_Power_Up(void)
         HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
         HAL_GPIO_WritePin(GPIOB, GPIO_PIN_11, GPIO_PIN_SET);
 
-        RFID_Carrier_Start(238U);
-        HAL_Delay(15);
+        RFID_Carrier_Start(237U);
+        HAL_Delay(6);
         s_rfid_powered = 1U;
     }
     g_rfid.tx_enable = 1U;
@@ -2127,7 +2182,7 @@ static void FDXB_Capture_And_Decode(uint32_t ch)
     uint16_t th_hi = (uint16_t)(mid + hyst);
     uint16_t th_lo = (uint16_t)(mid - hyst);
 
-    /* 2. Capture up to 320 edge intervals over 75 ms (~2.5 full 128-bit FDX-B frames) */
+    /* 2. Capture up to 320 edge intervals over 65 ms (~2.1 full 128-bit FDX-B frames) */
     uint8_t  local_dt4[320];
     uint16_t dt_cnt = 0U;
     uint8_t  st = 2U;
@@ -2135,7 +2190,7 @@ static void FDXB_Capture_And_Decode(uint32_t ch)
     uint8_t  h_idx = 0U;
     uint16_t t0 = (uint16_t)TIM21->CNT, last_e = t0;
 
-    while (((uint16_t)((uint16_t)TIM21->CNT - t0) < 75000U) && (dt_cnt < 320U)) {
+    while (((uint16_t)((uint16_t)TIM21->CNT - t0) < 65000U) && (dt_cnt < 320U)) {
         ADC1->CR |= ADC_CR_ADSTART;
         while ((ADC1->ISR & ADC_ISR_EOC) == 0U) {}
         v_hist[h_idx] = (uint16_t)ADC1->DR;
@@ -2251,15 +2306,20 @@ void RFID_Watch_Cycle(void)
 
     HAL_ADC_Start(&hadc);
     static const uint32_t chs[5] = {4, 5, 6, 7, 11};
-    static const uint16_t mode_arrs[4] = {238, 237, 238, 237};
-    static const uint16_t mode_tgts[4] = {1380, 1380, 1380, 1220};
-    for (int m = 0; m < 4; m++) {
+    static const uint16_t mode_arrs[2] = {237, 238};
+    static const uint16_t mode_tgts[2] = {1380, 1220};
+    uint32_t crc_cycle_start = g_fdxb.crc_ok_count;
+    for (int m = 0; m < 2; m++) {
         RFID_Carrier_Start(mode_arrs[m]);
         uint8_t pumped = RFID_Servo_PA7(mode_tgts[m]);
-        HAL_Delay(pumped ? 22U : 4U);
+        HAL_Delay(pumped ? 8U : 2U);
 
-        for (int c = 0; c < 5; c++) {
-            ADC_Sample_Stats(chs[c], 128, &g_watch.live_avg[m][c], &g_watch.live_span[m][c]);
+        if (snap_req) {
+            for (int c = 0; c < 5; c++) {
+                ADC_Sample_Stats(chs[c], 128, &g_watch.live_avg[m][c], &g_watch.live_span[m][c]);
+            }
+        } else {
+            ADC_Sample_Stats(5, 64, &g_watch.live_avg[m][1], &g_watch.live_span[m][1]);
         }
 
         /* Analog FDX-B interval counter on PA5 over 10 ms under synchronous HSE */
@@ -2295,7 +2355,12 @@ void RFID_Watch_Cycle(void)
         g_watch.live_pb2[m] = fdxb_valid;
 
         if (fdxb_valid >= 10U || snap_req) {
+            uint32_t crc_before = g_fdxb.crc_ok_count;
             FDXB_Capture_And_Decode(5U);
+            if (!snap_req && g_fdxb.crc_ok_count != crc_before) {
+                g_chip.detected_now = 1U;
+                break;
+            }
         }
 
         if (snap_req) {
@@ -2308,7 +2373,7 @@ void RFID_Watch_Cycle(void)
             if (m == 0) {
                 ADC_Capture_Burst(5, g_watch.snap_pa5_350, 32);
                 ADC_Capture_Burst(4, g_rfdiag.snap_pa5, 48);
-            } else if (m == 2) {
+            } else if (m == 1) {
                 ADC_Capture_Burst(5, g_rfdiag9.snap_pa7_238, 32);
                 ADC_Capture_Burst(6, g_rfdiag.snap_pa6, 48);
             }
@@ -2316,8 +2381,10 @@ void RFID_Watch_Cycle(void)
         }
     }
 
-    if (g_watch.cycle_count == 2U) {
-        for (int m = 0; m < 4; m++) {
+    if (g_fdxb.crc_ok_count != crc_cycle_start) {
+        g_chip.detected_now = 1U;
+    } else if (g_watch.cycle_count == 2U) {
+        for (int m = 0; m < 2; m++) {
             for (int c = 0; c < 5; c++) {
                 g_watch.base_avg[m][c] = g_watch.live_avg[m][c];
                 g_watch.base_span[m][c] = g_watch.live_span[m][c];
@@ -2325,13 +2392,11 @@ void RFID_Watch_Cycle(void)
         }
     } else if (g_watch.cycle_count > 2U) {
         uint8_t any_hit = 0U;
-        for (int m = 0; m < 4; m++) {
+        for (int m = 0; m < 2; m++) {
             int32_t d_sp4 = (int32_t)g_watch.live_span[m][0] - (int32_t)g_watch.base_span[m][0];
             int32_t d_sp5 = (int32_t)g_watch.live_span[m][1] - (int32_t)g_watch.base_span[m][1];
-            int32_t d_sp6 = (int32_t)g_watch.live_span[m][2] - (int32_t)g_watch.base_span[m][2];
             if (d_sp4 < 0) d_sp4 = 0;
             if (d_sp5 < 0) d_sp5 = 0;
-            if (d_sp6 < 0) d_sp6 = 0;
             uint32_t sc = (uint32_t)(d_sp4 + d_sp5) + (uint32_t)g_watch.live_pb2[m] * 200U;
             if (d_sp4 >= 350 || d_sp5 >= 350 || g_watch.live_pb2[m] >= 8U) {
                 g_watch.hit_count[m]++;
@@ -2343,16 +2408,13 @@ void RFID_Watch_Cycle(void)
                         g_watch.hit_span[m][c] = g_watch.live_span[m][c];
                     }
                     g_watch.hit_pb2[m] = g_watch.live_pb2[m];
-                    ADC1->SMPR = ADC_SAMPLETIME_12CYCLES_5;
-                    ADC_Capture_Burst(5, g_chip.latched_wave, 64);
-                    ADC1->SMPR = ADC_SAMPLETIME_160CYCLES_5;
                 }
             }
         }
         g_chip.detected_now = any_hit;
     }
 
-    RFID_Carrier_Start(238);
+    RFID_Carrier_Stop();
     HAL_ADC_Stop(&hadc);
     HSE_Exit_To_HSI_PLL();
     g_watch.cycle_count++;
@@ -3113,14 +3175,26 @@ void SysTick_Handler(void)
 {
     HAL_IncTick();
 
+    if (g_led_systick_blink == 1U) {
+        uint32_t t = HAL_GetTick();
+        if ((t % 1000U) < 500U) LED_GREEN_ON(); else LED_GREEN_OFF();
+        LED_RED_OFF();
+    } else if (g_led_systick_blink == 2U) {
+        uint32_t t = HAL_GetTick();
+        if ((t % 240U) < 120U) LED_GREEN_ON(); else LED_GREEN_OFF();
+        LED_RED_OFF();
+    }
+
     s_motor_pwm_counter++;
 
     if (s_target_motor_dir == MOTOR_STOP) {
+        g_motor_settled_on = 0U;
         GPIOE->BSRR = ((uint32_t)GPIO_PIN_11 << 16U) | ((uint32_t)GPIO_PIN_12 << 16U);
         return;
     }
 
     if (s_target_duty_pct >= 100) {
+        g_motor_settled_on = 1U;
         if (s_target_motor_dir == MOTOR_OPEN) {
             GPIOE->BSRR = ((uint32_t)GPIO_PIN_12 << 16U) | GPIO_PIN_11;
         } else if (s_target_motor_dir == MOTOR_CLOSE) {
@@ -3131,13 +3205,16 @@ void SysTick_Handler(void)
 
     uint8_t on_now;
     if (s_target_duty_pct <= 40U) {
-        /* ~1/3 speed (33.3% duty @ 333 Hz): 1 ms ON, 2 ms OFF */
-        on_now = ((s_motor_pwm_counter % 3U) == 0U) ? 1U : 0U;
+        /* ~1/3 speed (33.3% duty @ 83 Hz): 4 ms ON, 8 ms OFF; ms 1..3 are settled for ADC */
+        uint32_t step = s_motor_pwm_counter % 12U;
+        on_now = (step < 4U) ? 1U : 0U;
+        g_motor_settled_on = (step >= 1U && step < 4U) ? 1U : 0U;
     } else {
-        /* 75% duty (3/4 ms @ 250 Hz) or 50% duty (2/4 ms @ 250 Hz) */
-        uint32_t step = s_motor_pwm_counter % 4U;
-        uint32_t on_steps = (s_target_duty_pct >= 70U) ? 3U : 2U;
+        /* 75% duty (6/8 ms @ 125 Hz) or 50% duty (4/8 ms @ 125 Hz); skip step 0 turn-on transient */
+        uint32_t step = s_motor_pwm_counter % 8U;
+        uint32_t on_steps = (s_target_duty_pct >= 70U) ? 6U : 4U;
         on_now = (step < on_steps) ? 1U : 0U;
+        g_motor_settled_on = (on_now && step >= 1U) ? 1U : 0U;
     }
 
     if (on_now) {
