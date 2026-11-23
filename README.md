@@ -5,6 +5,9 @@ Custom, fully open-source STM32 firmware and complete PCB reverse-engineering do
 > [!WARNING]
 > Unlocking a stock feeder via SWD requires disabling STM32 Read-Out Protection (RDP Level 1 $\rightarrow$ Level 0), which **permanently mass-erases the factory SureFlap firmware**. You cannot back up or restore the stock binary afterward. Proceed at your own risk.
 
+> [!NOTE]
+> Independent community open-source project. Not affiliated with, authorized, or endorsed by Sure Petcare / SureFlap. All trademarks belong to their respective owners.
+
 ---
 
 ## Features

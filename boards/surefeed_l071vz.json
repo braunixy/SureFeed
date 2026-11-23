@@ -22,7 +22,7 @@
     "stm32cube"
   ],
   "name": "SureFeed Cat Feeder (STM32L071VZT6)",
-  "url": "https://github.com",
+  "url": "https://github.com/braunixy/SureFeed",
   "vendor": "Sure Petcare",
   "upload": {
     "maximum_ram_size": 20480,
